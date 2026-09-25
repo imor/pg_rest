@@ -45,14 +45,11 @@ pub const MAX_RESPONSE_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// Number of tokio worker threads used to send requests and receive responses.
 pub const HTTP_WORKER_THREADS: usize = 2;
 
-/// Maximum number of requests in flight to one host (host and port) at a time. Bounds the burst of
-/// new connections a full pipeline would otherwise open to a single server. Time spent waiting
-/// for a slot counts against the request's timeout. pg_net is implicitly bounded by its batch
-/// size (200 by default).
-pub const MAX_CONCURRENT_REQUESTS_PER_HOST: usize = 200;
-
-/// Number of per-host limiters kept before unused ones are forgotten.
-pub const HOST_LIMITS_PRUNE_AT: usize = 1024;
+/// Maximum number of connections being established (TCP connect plus TLS handshake) at a time,
+/// across all hosts. Without it, a full pipeline opens up to `MAX_IN_FLIGHT` connections to one
+/// server in a single burst, which can overflow its listen backlog. It limits connection attempts
+/// only: established keep-alive connections, and the requests on them, are not limited.
+pub const MAX_CONCURRENT_CONNECTS: usize = 50;
 
 /// How many times a request is retried on a fresh connection when the connection it was sent on
 /// died before any response arrived (typically a pooled keep-alive connection the server had just

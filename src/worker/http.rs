@@ -3,19 +3,15 @@
 //! Nothing in this module may call into Postgres: everything here runs on tokio threads, except
 //! `build_runtime` and `Http::send`, which only spawn tasks and are called from the main thread.
 
-use std::collections::HashMap;
 use std::error::Error as _;
 use std::io::ErrorKind;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::runtime::{Builder, Handle, Runtime};
 use tokio::sync::mpsc::UnboundedSender;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::consts::{
-    HOST_LIMITS_PRUNE_AT, HTTP_WORKER_THREADS, MAX_CONCURRENT_REQUESTS_PER_HOST,
-    MAX_RESPONSE_BODY_BYTES, STALE_CONNECTION_RETRIES,
+    HTTP_WORKER_THREADS, MAX_CONCURRENT_CONNECTS, MAX_RESPONSE_BODY_BYTES, STALE_CONNECTION_RETRIES,
 };
 use crate::worker::notify::WakeSender;
 use crate::worker::types::{HttpRequest, HttpResponse, Method, Outcome};
@@ -65,6 +61,13 @@ pub fn build_client() -> reqwest::Result<reqwest::Client> {
         .user_agent(USER_AGENT)
         // reqwest only speaks http and https, which matches pg_net's CURLOPT_PROTOCOLS_STR.
         .redirect(reqwest::redirect::Policy::limited(10))
+        // Limit connection attempts (TCP connect and TLS handshake), not requests: a full
+        // pipeline would otherwise open up to MAX_IN_FLIGHT connections to one server at once
+        // and overflow its listen backlog. Requests waiting for a connection reuse pooled ones
+        // as they become free, and the wait counts against their timeout.
+        .connector_layer(tower::limit::ConcurrencyLimitLayer::new(
+            MAX_CONCURRENT_CONNECTS,
+        ))
         .build()
 }
 
@@ -72,49 +75,8 @@ pub fn build_client() -> reqwest::Result<reqwest::Client> {
 pub struct Http {
     handle: Handle,
     client: reqwest::Client,
-    host_limits: Arc<HostLimits>,
     tx: UnboundedSender<HttpResponse>,
     waker: WakeSender,
-}
-
-/// Limits how many requests are in flight to each host at once, so that a large pipeline doesn't
-/// open `MAX_IN_FLIGHT` connections to a single server in one burst.
-#[derive(Default)]
-struct HostLimits {
-    hosts: Mutex<HashMap<String, Arc<Semaphore>>>,
-}
-
-impl HostLimits {
-    /// Waits up to `timeout` for a slot for the host of `url`. Returns `Ok(None)` for URLs
-    /// without a host (they fail when sent anyway) and `Err(())` on timeout.
-    async fn acquire(
-        &self,
-        url: &str,
-        timeout: Duration,
-    ) -> Result<Option<OwnedSemaphorePermit>, ()> {
-        let Some(key) = url::Url::parse(url)
-            .ok()
-            .and_then(|u| Some(format!("{}:{}", u.host_str()?, u.port_or_known_default()?)))
-        else {
-            return Ok(None);
-        };
-        let semaphore = {
-            let mut hosts = self.hosts.lock().unwrap_or_else(|e| e.into_inner());
-            if hosts.len() >= HOST_LIMITS_PRUNE_AT {
-                // Forget hosts nobody is using (the map holds the only reference).
-                hosts.retain(|_, s| Arc::strong_count(s) > 1);
-            }
-            hosts
-                .entry(key)
-                .or_insert_with(|| Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS_PER_HOST)))
-                .clone()
-        };
-        match tokio::time::timeout(timeout, semaphore.acquire_owned()).await {
-            Ok(Ok(permit)) => Ok(Some(permit)),
-            Ok(Err(_)) => Ok(None), // never closed
-            Err(_) => Err(()),
-        }
-    }
 }
 
 impl Http {
@@ -127,7 +89,6 @@ impl Http {
         Self {
             handle,
             client,
-            host_limits: Arc::default(),
             tx,
             waker,
         }
@@ -144,9 +105,8 @@ impl Http {
             sent: false,
         };
         let client = self.client.clone();
-        let host_limits = self.host_limits.clone();
         self.handle.spawn(async move {
-            let outcome = perform(&client, &host_limits, request).await;
+            let outcome = perform(&client, request).await;
             guard.send(outcome);
         });
     }
@@ -192,26 +152,9 @@ impl Drop for ResponseGuard {
     }
 }
 
-async fn perform(
-    client: &reqwest::Client,
-    host_limits: &HostLimits,
-    request: HttpRequest,
-) -> Outcome {
+async fn perform(client: &reqwest::Client, request: HttpRequest) -> Outcome {
     let timeout = request.timeout;
     let started = Instant::now();
-
-    // Waiting for a slot counts against the request's timeout.
-    let Ok(_permit) = host_limits.acquire(&request.url, timeout).await else {
-        return Outcome::Failure {
-            timed_out: true,
-            error_msg: format!(
-                "Timeout of {} ms reached while waiting for one of the \
-                 {MAX_CONCURRENT_REQUESTS_PER_HOST} connection slots to the host",
-                timeout.as_millis()
-            ),
-        };
-    };
-    let remaining = timeout.saturating_sub(started.elapsed());
 
     let method = match request.method {
         Method::Get => reqwest::Method::GET,
@@ -219,7 +162,7 @@ async fn perform(
         Method::Delete => reqwest::Method::DELETE,
     };
 
-    let mut builder = client.request(method, &request.url).timeout(remaining);
+    let mut builder = client.request(method, &request.url).timeout(timeout);
     for (name, value) in &request.headers {
         builder = builder.header(name, value);
     }

@@ -132,6 +132,9 @@ def run_scenario(dsn, ext, url, n, slow_fraction, slow_delay, timeout_s):
         "errors": errors,
         "total_s": total,
         "throughput": seen / total if total > 0 else 0,
+        # Throughput of the fast requests alone: how many completed by the time the last of
+        # them did. Unlike `throughput`, not dominated by the slow requests' tail.
+        "fast_throughput": len(fast) / fast[-1] if fast and fast[-1] > 0 else 0,
         "p50_s": percentile(arrivals, 50),
         "p99_s": percentile(arrivals, 99),
         "fast_p99_s": percentile(fast, 99),
@@ -158,7 +161,7 @@ def main():
         time.sleep(2)
 
     print(
-        f"{'scenario':<22} {'ext':<8} {'done':>6} {'errors':>6} {'total s':>8} {'req/s':>8} "
+        f"{'scenario':<22} {'ext':<8} {'done':>6} {'errors':>6} {'total s':>8} {'req/s':>8} {'fast req/s':>10} "
         f"{'p50 s':>7} {'p99 s':>7} {'fast p99 s':>10} {'max xact s':>10}"
     )
     for fraction in [float(f) for f in args.slow_fractions.split(",")]:
@@ -167,7 +170,7 @@ def main():
             r = run_scenario(args.dsn, ext, args.url, args.n, fraction, args.slow_delay, args.timeout)
             print(
                 f"{scenario:<22} {r['ext']:<8} {r['completed']:>6} {r['errors']:>6} "
-                f"{r['total_s']:>8.2f} {r['throughput']:>8.0f} {r['p50_s']:>7.2f} "
+                f"{r['total_s']:>8.2f} {r['throughput']:>8.0f} {r['fast_throughput']:>10.0f} {r['p50_s']:>7.2f} "
                 f"{r['p99_s']:>7.2f} {r['fast_p99_s']:>10.2f} {r['max_xact_s']:>10.2f}",
                 flush=True,
             )

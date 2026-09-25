@@ -72,7 +72,7 @@ pg_rest has no GUCs yet. Every tunable that could become one lives in [src/const
 | `RESPONSE_TTL` | 6 hours | responses older than this are deleted (pg_net: `pg_net.ttl`) |
 | `MAX_TIMEOUT_MS` | 600000 | upper bound on `timeout_milliseconds` (pg_net: `pg_net.max_timeout_ms`) |
 | `MAX_RESPONSE_BODY_BYTES` | 64 MiB | larger responses are recorded as errors |
-| `MAX_CONCURRENT_REQUESTS_PER_HOST` | 200 | requests in flight to one host at a time; waiting for a slot counts against the request's timeout |
+| `MAX_CONCURRENT_CONNECTS` | 50 | connections being established (TCP + TLS) at once, so a full pipeline doesn't hit one server with `MAX_IN_FLIGHT` new connections in a single burst; requests on established keep-alive connections aren't limited |
 | `STALE_CONNECTION_RETRIES` | 1 | retries on a fresh connection when a pooled keep-alive connection died before any response (as curl does) |
 | `HTTP_WORKER_THREADS` | 2 | tokio threads that do the HTTP work |
 
@@ -205,17 +205,22 @@ settings. Each run enqueued 10,000 GETs to the local mock server in one transact
 
 - **Latency** is the time from the enqueue commit until the response is visible in the response
   table.
-- **fast p99** is the p99 latency of the earliest (N − slow) completions.
+- **throughput** is N divided by the time until the *last* response. With slow requests, the
+  slow tail dominates it.
+- **fast throughput** and **fast p99** cover the earliest (N − slow) completions, i.e. the fast
+  requests on their own.
 - **max xact** is the longest time the worker's transaction was open.
 
-| slow requests | ext | total | throughput | p50 latency | p99 latency | fast p99 | max xact |
-|---|---|---:|---:|---:|---:|---:|---:|
-| 0% | pg_net | 50.1 s | 200 req/s | 25.6 s | 50.1 s | 50.1 s | 0.02 s |
-| 0% | pg_rest | 0.21 s | 47,143 req/s | 0.12 s | 0.20 s | 0.20 s | 0 |
-| 0.1% | pg_net | 70.0 s | 143 req/s | 35.5 s | 70.0 s | 70.0 s | 2.01 s |
-| 0.1% | pg_rest | 2.27 s | 4,414 req/s | 0.12 s | 0.20 s | 0.20 s | 0 |
-| 1% | pg_net | 150.0 s | 67 req/s | 77.5 s | 150.0 s | 150.0 s | 2.02 s |
-| 1% | pg_rest | 2.25 s | 4,445 req/s | 0.13 s | 0.27 s | 0.20 s | 0 |
+| slow requests | ext | total | throughput | fast throughput | p50 latency | p99 latency | fast p99 | max xact |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| 0% | pg_net | 50.1 s | 200 req/s | 200 req/s | 25.6 s | 50.1 s | 50.1 s | 0.02 s |
+| 0% | pg_rest | 0.22 s | 45,325 req/s | 48,050 req/s | 0.13 s | 0.21 s | 0.21 s | 0 |
+| 0.1% | pg_net | 70.1 s | 143 req/s | 143 req/s | 35.6 s | 70.1 s | 70.1 s | 2.02 s |
+| 0.1% | pg_rest | 2.28 s | 4,388 req/s | 47,123 req/s | 0.14 s | 0.21 s | 0.21 s | 0 |
+| 1% | pg_net | 150.0 s | 67 req/s | 66 req/s | 77.5 s | 150.0 s | 150.0 s | 2.02 s |
+| 1% | pg_rest | 2.32 s | 4,312 req/s | 36,454 req/s | 0.19 s | 0.27 s | 0.27 s | 0 |
+| 10% | pg_net | 150.0 s | 67 req/s | 67 req/s | 77.5 s | 149.9 s | 134.8 s | 2.02 s |
+| 10% | pg_rest | 4.13 s | 2,422 req/s | 4,377 req/s | 0.18 s | 2.29 s | 1.46 s | 0 |
 
 How to read the table:
 
@@ -223,9 +228,13 @@ How to read the table:
   between batches.
 - **pg_net, with slow requests.** Every batch that contains a slow request waits for it before
   committing, and the transaction stays open for the whole 2 s.
-- **pg_rest, with slow requests.** The total time is about the time of one slow request. Fast
-  responses are unaffected (fast p99 ≈ 0.2 s), and the worker never holds a transaction open for
-  noticeable time.
+- **pg_rest up to 1% slow.** The total time is about one slow request. The fast requests keep
+  36k–48k req/s. That figure is probably limited by the single-threaded Python mock server.
+- **pg_rest at 10% slow.** 1,000 slow requests × 2 s need 2,000 slot-seconds, which is
+  about 2 s at `MAX_IN_FLIGHT` = 1000, so fast requests start waiting for free slots. For
+  workloads that are mostly slow, raising `MAX_IN_FLIGHT` is the lever. Its cost is memory for
+  the requests in flight.
+- **pg_rest never holds a transaction open** for any noticeable time.
 
 ### CPU usage
 
@@ -236,17 +245,17 @@ the same for both extensions. The setup is the same as above.
 | scenario | ext | wall | CPU | CPU % | CPU per 1k requests |
 |---|---|---:|---:|---:|---:|
 | idle, 30 s | pg_net | 30.0 s | 0.00 s | 0.0 | – |
-| idle, 30 s | pg_rest | 30.0 s | 0.03 s | 0.1 | – |
-| burst, 10k, 0% slow | pg_net | 50.6 s | 0.99 s | 2.0 | 99 ms |
-| burst, 10k, 0% slow | pg_rest | 0.71 s | 0.45 s | 62.9 | 45 ms |
-| burst, 10k, 1% slow | pg_net | 150.4 s | 1.00 s | 0.7 | 100 ms |
-| burst, 10k, 1% slow | pg_rest | 2.66 s | 0.45 s | 17.0 | 45 ms |
-| steady, 100 req/s for 30 s | pg_net | 30.5 s | 0.37 s | 1.2 | 123 ms |
-| steady, 100 req/s for 30 s | pg_rest | 30.0 s | 0.93 s | 3.1 | 312 ms |
+| idle, 30 s | pg_rest | 30.0 s | 0.05 s | 0.2 | – |
+| burst, 10k, 0% slow | pg_net | 50.7 s | 1.07 s | 2.1 | 107 ms |
+| burst, 10k, 0% slow | pg_rest | 0.74 s | 0.58 s | 78.8 | 58 ms |
+| burst, 10k, 1% slow | pg_net | 150.6 s | 1.16 s | 0.8 | 116 ms |
+| burst, 10k, 1% slow | pg_rest | 2.77 s | 0.65 s | 23.5 | 65 ms |
+| steady, 100 req/s for 30 s | pg_net | 30.6 s | 0.41 s | 1.3 | 137 ms |
+| steady, 100 req/s for 30 s | pg_rest | 30.0 s | 1.04 s | 3.5 | 348 ms |
 
 - **Bursts.** pg_rest uses about half the CPU per request. Its CPU % is higher only because it
-  finishes 20–70× sooner.
-- **Idle.** pg_rest wakes every second for TTL cleanup, which costs about 0.1% of a core.
+  finishes 50–70× sooner.
+- **Idle.** pg_rest wakes every second for TTL cleanup, which costs about 0.1–0.2% of a core.
 - **Low steady rates.** pg_rest costs about 2.5× more per request. pg_net handles everything that
   arrived in the last second in one transaction. pg_rest commits a claim soon after each wake and
   commits each partial bucket when its 50 ms deadline passes, so it runs many more small
