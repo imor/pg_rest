@@ -1,5 +1,8 @@
 # pg_rest vs pg_net benchmarks
 
+For pg_rest running in pg_net's own CI loadtest harness, see
+[pg_net_loadtest/comparison.md](pg_net_loadtest/comparison.md).
+
 ## Setup
 
 - **Machine:** one Apple Silicon laptop running macOS. The database, the workers, the benchmark

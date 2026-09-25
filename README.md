@@ -198,6 +198,11 @@ uv run --with 'psycopg[binary]' --with psutil python bench/cpu_bench.py --dsn 'h
 
 ## Benchmark
 
+Full results are in [bench/benchmarks.md](bench/benchmarks.md): default settings,
+pg_net without its pause, pg_rest with pg_net-style pauses, and logged vs unlogged tables.
+[bench/pg_net_loadtest/comparison.md](bench/pg_net_loadtest/comparison.md) runs both extensions
+in pg_net's CI loadtest harness.
+
 All runs used `bench/bench.py` on one laptop (Apple Silicon, macOS), with an assert-enabled
 PG 18.6 build from `cargo pgrx init`, a release build of pg_rest and pg_net 0.20.4 with default
 settings. Each run enqueued 10,000 GETs to the local mock server in one transaction. The
