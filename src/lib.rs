@@ -1,49 +1,42 @@
+//! pg_rest: asynchronous HTTP requests from Postgres, with a pipelined background worker.
+
 use pgrx::prelude::*;
+
+mod api;
+mod consts;
+mod schema;
+mod shmem;
+mod worker;
 
 ::pgrx::pg_module_magic!(name, version);
 
-#[pg_extern]
-fn hello_pg_rest() -> &'static str {
-    "Hello, pg_rest"
-}
-
-#[cfg(any(test, feature = "pg_test"))]
-#[pg_schema]
-mod tests {
-    use pgrx::prelude::*;
-
-    #[pg_test]
-    fn test_hello_pg_rest() {
-        assert_eq!("Hello, pg_rest", crate::hello_pg_rest());
+#[pg_guard]
+pub extern "C-unwind" fn _PG_init() {
+    if unsafe { pg_sys::IsBinaryUpgrade } {
+        return;
     }
 
-}
-
-#[cfg(feature = "pg_bench")]
-#[pg_schema]
-mod benches {
-    use pgrx::prelude::*;
-    use pgrx_bench::{Bencher, black_box};
-
-    #[pg_bench]
-    fn bench_hello_pg_rest(b: &mut Bencher) {
-        b.iter(|| {
-            black_box(crate::hello_pg_rest());
-        });
+    if unsafe { !pg_sys::process_shared_preload_libraries_in_progress } {
+        ereport!(
+            ERROR,
+            PgSqlErrorCode::ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE,
+            "pg_rest is not in shared_preload_libraries",
+            "Add pg_rest to the shared_preload_libraries configuration variable in postgresql.conf."
+        );
     }
+
+    shmem::init();
+    worker::register();
 }
 
 /// This module is required by `cargo pgrx test` invocations.
 /// It must be visible at the root of your extension crate.
 #[cfg(test)]
 pub mod pg_test {
-    pub fn setup(_options: Vec<&str>) {
-        // perform one-off initialization when the pg_test framework starts
-    }
+    pub fn setup(_options: Vec<&str>) {}
 
     #[must_use]
     pub fn postgresql_conf_options() -> Vec<&'static str> {
-        // return any postgresql.conf settings that are required for your tests
-        vec![]
+        vec!["shared_preload_libraries = 'pg_rest'"]
     }
 }

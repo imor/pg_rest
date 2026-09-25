@@ -1,0 +1,83 @@
+-- SQL surface of pg_rest. Enqueueing happens inside rolled-back transactions so that the
+-- background worker never sees these requests and the output stays deterministic.
+select p.proname, pg_get_function_identity_arguments(p.oid) as args, pg_get_function_result(p.oid) as result
+from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+where n.nspname = 'rest'
+order by p.proname;
+        proname         |                                      args                                       |          result           
+------------------------+---------------------------------------------------------------------------------+---------------------------
+ _await_response        | request_id bigint                                                               | boolean
+ _http_collect_response | request_id bigint, async boolean                                                | rest.http_response_result
+ check_worker_is_up     |                                                                                 | void
+ http_delete            | url text, params jsonb, headers jsonb, timeout_milliseconds integer, body jsonb | bigint
+ http_get               | url text, params jsonb, headers jsonb, timeout_milliseconds integer             | bigint
+ http_post              | url text, body jsonb, params jsonb, headers jsonb, timeout_milliseconds integer | bigint
+ wait_until_running     |                                                                                 | void
+ wake                   |                                                                                 | void
+ worker_restart         |                                                                                 | boolean
+(9 rows)
+
+select c.relname, c.relpersistence
+from pg_class c join pg_namespace n on n.oid = c.relnamespace
+where n.nspname = 'rest' and c.relkind = 'r'
+order by c.relname;
+      relname       | relpersistence 
+--------------------+----------------
+ _http_response     | u
+ http_request_queue | u
+(2 rows)
+
+begin;
+select rest.http_get('http://localhost:8080/anything', params := '{"hello": "world", "a b": "c&d"}') > 0 as enqueued;
+ enqueued 
+----------
+ t
+(1 row)
+
+select rest.http_post('http://localhost:8080/post', '{"hello": "world"}') > 0 as enqueued;
+ enqueued 
+----------
+ t
+(1 row)
+
+select rest.http_post('http://localhost:8080/post', headers := '{"X-Test": "1"}') > 0 as enqueued;
+ enqueued 
+----------
+ t
+(1 row)
+
+select rest.http_delete('http://localhost:8080/delete', timeout_milliseconds := 100) > 0 as enqueued;
+ enqueued 
+----------
+ t
+(1 row)
+
+select method, url, headers, convert_from(body, 'UTF8') as body, timeout_milliseconds, claimed_at
+from rest.http_request_queue
+order by id;
+ method |                          url                           |                       headers                       |        body        | timeout_milliseconds | claimed_at 
+--------+--------------------------------------------------------+-----------------------------------------------------+--------------------+----------------------+------------
+ GET    | http://localhost:8080/anything?a%20b=c%26d&hello=world | {}                                                  |                    |                 5000 | 
+ POST   | http://localhost:8080/post                             | {"Content-Type": "application/json"}                | {"hello": "world"} |                 5000 | 
+ POST   | http://localhost:8080/post                             | {"X-Test": "1", "Content-Type": "application/json"} | {}                 |                 5000 | 
+ DELETE | http://localhost:8080/delete                           | {}                                                  |                    |                  100 | 
+(4 rows)
+
+rollback;
+-- invalid requests are rejected when they are enqueued
+\set VERBOSITY terse
+select rest.http_get('/malformed_url');
+ERROR:  invalid URL "/malformed_url": relative URL without a base
+select rest.http_get('localhost:8080');
+ERROR:  invalid URL "localhost:8080": Unsupported URL scheme
+select rest.http_get(null);
+ERROR:  null value in column "url" of relation "http_request_queue" violates not-null constraint
+select rest.http_post('http://localhost:8080/post', headers := '{"Content-Type": "text/plain"}');
+ERROR:  Content-Type header must be "application/json"
+-- collecting a response that doesn't exist
+select * from rest._http_collect_response(-1);
+ status |                message                | response 
+--------+---------------------------------------+----------
+ ERROR  | request matching request_id not found | 
+(1 row)
+

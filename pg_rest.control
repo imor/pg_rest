@@ -1,4 +1,4 @@
-comment = 'pg_rest:  Created by pgrx'
+comment = 'pg_rest: asynchronous HTTP requests with a pipelined background worker'
 default_version = '@CARGO_VERSION@'
 module_pathname = 'pg_rest'
 relocatable = false
