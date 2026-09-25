@@ -5,7 +5,7 @@ It mirrors the endpoints of pg_net's nginx test server (nix/nginx/conf/custom.co
 port 8080, plus an IPv6-only server on port 8888. It is written against raw asyncio streams so
 that it can also misbehave on purpose (malformed headers, dropped connections).
 
-Usage: python3 test/mock_server.py [--port 8080] [--ipv6-port 8888]
+Usage: python3 tests/mock_server.py [--port 8080] [--ipv6-port 8888]
 """
 
 import argparse

@@ -179,20 +179,21 @@ cargo pgrx test pg18      # #[pg_test]s: URL encoding, enqueueing, request valid
 `cargo pgrx regress` needs `shared_preload_libraries = 'pg_rest'` in `~/.pgrx/data-NN/postgresql.conf`.
 You can also run `pg_regress --use-existing` against any cluster that preloads pg_rest.
 
-**End-to-end tests.** They live in [test/](test), ported from pg_net's pytest suite, and need a
+**End-to-end tests.** They live in [tests/](tests), ported from pg_net's pytest suite, and need a
 running cluster with pg_rest preloaded plus the mock HTTP server:
 
 ```sh
-python3 test/mock_server.py &           # pg_net's nginx test endpoints on :8080 (and [::1]:8888)
+python3 tests/mock_server.py &           # pg_net's nginx test endpoints on :8080 (and [::1]:8888)
 PGHOST=127.0.0.1 PGPORT=5432 PGUSER=postgres \
-  uv run --with pytest --with 'psycopg[binary]' --with sqlalchemy pytest test
+  uv run --with pytest --with 'psycopg[binary]' --with sqlalchemy pytest tests
 ```
 
 **Benchmark against pg_net.** This needs a cluster with `shared_preload_libraries = 'pg_net, pg_rest'`:
 
 ```sh
-python3 test/mock_server.py --port 8090 --ipv6-port 8891 &
+python3 tests/mock_server.py --port 8090 --ipv6-port 8891 &
 uv run --with 'psycopg[binary]' python bench/bench.py --dsn 'host=127.0.0.1 port=5432 user=postgres dbname=postgres' -n 10000
+uv run --with 'psycopg[binary]' --with psutil python bench/cpu_bench.py --dsn 'host=127.0.0.1 port=5432 user=postgres dbname=postgres'
 ```
 
 ## Benchmark
@@ -225,3 +226,29 @@ How to read the table:
 - **pg_rest, with slow requests.** The total time is about the time of one slow request. Fast
   responses are unaffected (fast p99 ≈ 0.2 s), and the worker never holds a transaction open for
   noticeable time.
+
+### CPU usage
+
+`bench/cpu_bench.py` measures the CPU time (user + system) of each extension's worker process.
+For pg_rest this includes its tokio threads. It does not count the cost of enqueueing, which is
+the same for both extensions. The setup is the same as above.
+
+| scenario | ext | wall | CPU | CPU % | CPU per 1k requests |
+|---|---|---:|---:|---:|---:|
+| idle, 30 s | pg_net | 30.0 s | 0.00 s | 0.0 | – |
+| idle, 30 s | pg_rest | 30.0 s | 0.03 s | 0.1 | – |
+| burst, 10k, 0% slow | pg_net | 50.6 s | 0.99 s | 2.0 | 99 ms |
+| burst, 10k, 0% slow | pg_rest | 0.71 s | 0.45 s | 62.9 | 45 ms |
+| burst, 10k, 1% slow | pg_net | 150.4 s | 1.00 s | 0.7 | 100 ms |
+| burst, 10k, 1% slow | pg_rest | 2.66 s | 0.45 s | 17.0 | 45 ms |
+| steady, 100 req/s for 30 s | pg_net | 30.5 s | 0.37 s | 1.2 | 123 ms |
+| steady, 100 req/s for 30 s | pg_rest | 30.0 s | 0.93 s | 3.1 | 312 ms |
+
+- **Bursts.** pg_rest uses about half the CPU per request. Its CPU % is higher only because it
+  finishes 20–70× sooner.
+- **Idle.** pg_rest wakes every second for TTL cleanup, which costs about 0.1% of a core.
+- **Low steady rates.** pg_rest costs about 2.5× more per request. pg_net handles everything that
+  arrived in the last second in one transaction. pg_rest commits a claim soon after each wake and
+  commits each partial bucket when its 50 ms deadline passes, so it runs many more small
+  transactions. That is the price of low latency. Raising `RESPONSE_BUCKET_MAX_WAIT` trades
+  latency for fewer transactions.
