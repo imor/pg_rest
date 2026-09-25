@@ -122,6 +122,69 @@ CPU per 1,000 requests:
 | burst, 1% slow | 116 ms | 65 ms | 106 ms | 55 ms |
 | steady 100 req/s | 137 ms | 127 ms | 129 ms | 384 ms |
 
+## 4. Logged vs unlogged tables
+
+pg_rest's tables are now regular logged tables. Sections 1–3 used the earlier unlogged tables.
+Both modes below ran the same build, back to back: first logged, then after
+`ALTER TABLE … SET UNLOGGED` on both tables. WAL settings: `synchronous_commit = on`,
+`wal_sync_method = open_datasync`, `full_page_writes = on`, `wal_level = replica`.
+
+| slow | tables | total | req/s | fast req/s | p50 | p99 | fast p99 | max xact |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| 0% | logged | 0.32 s | 31,334 | 32,450 | 0.21 s | 0.31 s | 0.31 s | 0 |
+| 0% | unlogged | 0.24 s | 42,535 | 44,927 | 0.13 s | 0.22 s | 0.22 s | 0 |
+| 0.1% | logged | 2.29 s | 4,365 | 37,072 | 0.18 s | 0.27 s | 0.27 s | 0 |
+| 0.1% | unlogged | 2.28 s | 4,383 | 38,226 | 0.12 s | 0.21 s | 0.21 s | 0 |
+| 1% | logged | 2.24 s | 4,456 | 45,534 | 0.13 s | 0.22 s | 0.22 s | 0 |
+| 1% | unlogged | 2.24 s | 4,462 | 38,359 | 0.12 s | 0.26 s | 0.21 s | 0 |
+| 10% | logged | 4.11 s | 2,434 | 4,431 | 0.12 s | 2.24 s | 1.37 s | 0 |
+| 10% | unlogged | 4.10 s | 2,438 | 4,440 | 0.12 s | 2.24 s | 1.38 s | 0 |
+
+The same 10k burst with no slow requests, run once more per mode right after a checkpoint:
+
+| tables | total | req/s | WAL written (enqueue + worker) |
+|---|---:|---:|---:|
+| logged | 0.23 s | 43,384 | 8.4 MB (about 860 bytes per request) |
+| unlogged | 0.22 s | 45,901 | 11 kB |
+
+CPU per 1,000 requests:
+
+| scenario | logged | unlogged |
+|---|---:|---:|
+| idle (share of a core) | 0.0% | 0.1% |
+| burst, 0% slow | 47 ms | 45 ms |
+| burst, 1% slow | 50 ms | 48 ms |
+| steady 100 req/s | 334 ms | 363 ms |
+
+**On this machine, WAL logging has no measurable effect on throughput, latency or worker CPU.**
+The differences between the two modes are within run-to-run noise: the 0% row differs in the main
+table, but the repeat run after a checkpoint shows 0.23 s vs 0.22 s. WAL is written and flushed
+by Postgres processes other than the worker (the committing backend, the WAL writer), so the
+worker CPU column doesn't include it.
+
+This machine is a best case for WAL. The worker commits about once per 100 responses, so a burst
+of 10k requests causes only about 100–200 WAL flushes, and a laptop SSD flushes fast. The cost
+shows up elsewhere:
+
+- **Slow flushes.** On disks with ~1–5 ms flushes (network block storage, for example), each
+  worker commit waits that long with `synchronous_commit = on`. At 100–200 commits per 10k
+  requests, that adds roughly 0.1–1 s per 10k requests.
+- **WAL volume.** About 860 bytes per request, which replicas, backups and WAL archiving all
+  have to handle.
+
+Logged tables mean requests and responses survive a crash, and they are replicated to standbys.
+
+**Planner bug found and fixed while running this.** The first unlogged run, right after
+`SET UNLOGGED` had rewritten the tables with empty statistics, had one transaction open for
+13.9 s. The claim query joined the queue to a `LIMIT … FOR UPDATE SKIP LOCKED` subquery. With a
+1-row estimate, the planner chose a nested loop that re-ran the locking subquery for every queue
+row: 14.2 s for a 10k-row queue, and more rows claimed than the limit allowed. The same can
+happen in production when autovacuum records an empty queue just before a burst. The claim and
+TTL queries now use `id = any(array(subquery))` and `ctid = any(array(subquery))`. The subquery
+runs once, and the update is an index or TID lookup whatever the estimates: 4.3 ms on the same
+data. The numbers in this section are from the fixed build; sections 1–3 used the old queries,
+which had fresh statistics at the time.
+
 ## Takeaways
 
 **Pipelining beats batching even without pg_net's pause.** Section 2 removes pg_net's 1 s pause.

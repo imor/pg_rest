@@ -23,8 +23,8 @@ where n.nspname = 'rest' and c.relkind = 'r'
 order by c.relname;
       relname       | relpersistence 
 --------------------+----------------
- _http_response     | u
- http_request_queue | u
+ _http_response     | p
+ http_request_queue | p
 (2 rows)
 
 begin;

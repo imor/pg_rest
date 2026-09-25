@@ -18,7 +18,7 @@ check (
 -- Pending and in-flight requests. The background worker claims rows by setting `claimed_at`, and
 -- deletes them in the same transaction that inserts their response.
 -- API: Private
-create unlogged table rest.http_request_queue(
+create table rest.http_request_queue(
     id bigserial primary key,
     method rest.http_method not null,
     url text not null,
@@ -33,7 +33,7 @@ create index http_request_queue_unclaimed_idx on rest.http_request_queue (id) wh
 
 -- Associates a response with a request
 -- API: Private
-create unlogged table rest._http_response(
+create table rest._http_response(
     id bigint,
     status_code integer,
     content_type text,

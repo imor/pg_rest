@@ -30,30 +30,34 @@ const RETIRE_SQL: &CStr = c"
     delete from rest.http_request_queue where id = any($1)";
 
 /// `skip locked` so that the worker never waits on a row a user session has locked.
+///
+/// The ids are collected with `= any(array(...))` rather than a join: the subquery then runs
+/// exactly once (as an InitPlan) and the update is a primary key lookup, whatever the planner's
+/// row estimates. With a join, stale statistics (e.g. `reltuples = 0` after autovacuum ran on an
+/// empty queue) can produce a nested loop that re-runs the locking subquery for every queue row.
 const CLAIM_SQL: &CStr = c"
-    update rest.http_request_queue q
+    update rest.http_request_queue
     set claimed_at = now()
-    from (
+    where id = any(array(
         select id
         from rest.http_request_queue
         where claimed_at is null
         order by id
         limit $1
         for update skip locked
-    ) c
-    where q.id = c.id
-    returning q.id, q.method::text, q.url, q.timeout_milliseconds, q.headers, q.body";
+    ))
+    returning id, method::text, url, timeout_milliseconds, headers, body";
 
+/// `= any(array(...))` for the same reason as `CLAIM_SQL`; it runs as a TID scan.
 const DELETE_EXPIRED_SQL: &CStr = c"
-    with rows as (
+    delete from rest._http_response
+    where ctid = any(array(
         select ctid
         from rest._http_response
         where created < now() - $1::interval
         order by created
         limit $2
-    )
-    delete from rest._http_response r
-    using rows where r.ctid = rows.ctid";
+    ))";
 
 /// Runs `f` in its own transaction and commits it. Errors raised by Postgres propagate as
 /// panics; they end the worker, and the postmaster restarts it.
