@@ -12,11 +12,17 @@ from common import get_queue_length, restart_worker, wait_for_queue_drain
 from common import wait_for_response_count, wait_for_worker_state, wait_until
 
 
+# Longest a worker transaction may have been open when sampled. The worker's own transactions
+# (claim/retire, TTL cleanup) take milliseconds.
+BRIEF_XACT_S = 0.5
+
+
 def worker_activity(autocommit_sess):
+    """The worker's state and how long its current transaction has been open (None if none)."""
     return autocommit_sess.execute(
         text(
             """
-        select state, xact_start
+        select state, extract(epoch from clock_timestamp() - xact_start)::float8
         from pg_stat_activity
         where backend_type ilike '%pg_rest%'
     """
@@ -76,14 +82,16 @@ def test_slow_request_does_not_hold_back_fast_ones(sess, autocommit_sess):
     assert get_queue_length(autocommit_sess)() == 1
     assert max(fast_ids) > slow_id
 
-    # While the slow request is in flight the worker is active, but holds no transaction open.
+    # While the slow request is in flight the worker is active, but holds no transaction open
+    # for it. A sample can still land inside the short TTL-cleanup transaction the worker runs
+    # every second, so a transaction that has only just started is allowed.
     # Sample it a few times over the remaining ~1s the slow request has left.
     deadline = committed_at + 2.5
     samples = 0
     while time.time() < deadline:
-        (state, xact_start) = worker_activity(autocommit_sess)
+        (state, xact_age) = worker_activity(autocommit_sess)
         assert state == "active"
-        assert xact_start is None
+        assert xact_age is None or xact_age < BRIEF_XACT_S, f"transaction open for {xact_age}s"
         samples += 1
         time.sleep(0.05)
     assert samples > 0
@@ -98,8 +106,9 @@ def test_slow_request_does_not_hold_back_fast_ones(sess, autocommit_sess):
         text("select status_code from rest._http_response where id = :id"), {"id": slow_id}
     ).one()
     assert status_code == 200
-    (state, xact_start) = worker_activity(autocommit_sess)
-    assert (state, xact_start) == ("idle", None)
+    (state, xact_age) = worker_activity(autocommit_sess)
+    assert state == "idle"
+    assert xact_age is None or xact_age < BRIEF_XACT_S, f"transaction open for {xact_age}s"
 
 
 def test_in_flight_requests_survive_worker_restart(sess, autocommit_sess):
