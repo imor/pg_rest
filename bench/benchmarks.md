@@ -188,6 +188,65 @@ runs once, and the update is an index or TID lookup whatever the estimates: 4.3 
 data. The numbers in this section are from the fixed build; sections 1–3 used the old queries,
 which had fresh statistics at the time.
 
+## 5. Response bucket size: 100 vs 1
+
+The default (`RESPONSE_BUCKET_SIZE = 100`, with a 50 ms deadline) is compared against a build
+that commits every response in its own transaction (`RESPONSE_BUCKET_SIZE = 1`, a temporary
+change, reverted afterwards). Everything else is at its default: 1,000 requests in flight and
+logged tables. Both ran back to back on a freshly created extension.
+
+| slow | bucket size | total | req/s | fast req/s | p50 | p99 | fast p99 | max xact |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0% | 100 | 0.28 s | 35,899 | 37,588 | 0.18 s | 0.27 s | 0.27 s | 0 |
+| 0% | 1 | 3.93 s | 2,546 | 2,554 | 2.04 s | 3.89 s | 3.89 s | 0 |
+| 0.1% | 100 | 2.27 s | 4,397 | 48,894 | 0.13 s | 0.20 s | 0.20 s | 0 |
+| 0.1% | 1 | 5.83 s | 1,714 | 2,440 | 2.14 s | 4.07 s | 4.07 s | 0 |
+| 1% | 100 | 2.24 s | 4,471 | 49,384 | 0.12 s | 0.20 s | 0.20 s | 0 |
+| 1% | 1 | 5.93 s | 1,685 | 2,372 | 2.17 s | 4.17 s | 4.15 s | 0 |
+| 10% | 100 | 4.10 s | 2,437 | 4,424 | 0.13 s | 2.24 s | 1.40 s | 0 |
+| 10% | 1 | 6.04 s | 1,655 | 2,239 | 2.24 s | 5.57 s | 3.97 s | 0 |
+
+One 10k burst with no slow requests, measured right after a checkpoint:
+
+| bucket size | total | commits in the database | WAL written |
+|---:|---:|---:|---:|
+| 100 | 0.27 s | 166 | 8.4 MB |
+| 1 | 4.36 s | 10,597 | 10.1 MB |
+
+"Commits in the database" counts all backends, including the enqueueing session. The worker
+accounts for almost all of them.
+
+CPU per 1,000 requests:
+
+| scenario | bucket size 100 | bucket size 1 |
+|---|---:|---:|
+| idle (share of a core) | 0.1% | 0.3% |
+| burst, 0% slow | 47 ms | 411 ms |
+| burst, 1% slow | 46 ms | 438 ms |
+| steady 100 req/s | 442 ms | 868 ms |
+
+**Batching commits matters about as much as pipelining.** Committing each response on its own:
+
+- raises the commit count 64× (166 → 10,597 per 10k requests);
+- makes the worker 14× slower when nothing is slow (0.28 s → 3.93 s), and cuts fast-request
+  throughput about 20× when there are slow requests;
+- raises median latency from about 0.13 s to about 2 s;
+- costs about 9× more CPU per request on bursts (47 → 411 ms per 1k), and 2× more at a steady
+  100 req/s.
+
+The worker's single Postgres thread becomes the bottleneck: it was busy 94% of the time during
+the no-slow burst, doing little besides running one transaction per response. WAL grows by only
+20% (8.4 → 10.1 MB), because most WAL is the row data itself rather than commit records. Per-row
+commits cost CPU and latency, not WAL volume.
+
+Even with a bucket of 1, pg_rest is 13× faster than pg_net with default settings on 10k fast
+requests (3.9 s vs 50.1 s), and never holds a transaction open. Pipelining and the missing 1 s
+pause still help. But a large share of the headroom comes from committing responses in batches.
+
+The baseline's steady-rate CPU (442 ms per 1k) is higher than in earlier sections (334–389 ms).
+The steady scenario varies noticeably between runs; compare the two columns of this table rather
+than figures across sections.
+
 ## Takeaways
 
 **Pipelining beats batching even without pg_net's pause.** Section 2 removes pg_net's 1 s pause.
@@ -204,6 +263,10 @@ transaction, so CPU at low rates is set by how often they commit.
 **With the same pause and the same batch size, pipelining still wins with slow requests.** This
 is the "1 s, 200 in flight" row in section 3. It matches pg_net with no slow requests (51.5 s vs
 50.1 s), and is 2.6–2.8× faster with 1–10% slow requests (53–57 s vs 150 s).
+
+**Committing responses in buckets matters as much as pipelining.** With a bucket of 1, one
+transaction per response, pg_rest is 14× slower on fast bursts and uses 9× more CPU per request
+(section 5).
 
 **A 50 ms pause does not reduce steady-rate CPU at 100 req/s.** The steady benchmark enqueues a
 batch every 100 ms. A 50 ms pause is shorter than that gap, so pg_rest still commits about twice
