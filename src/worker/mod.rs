@@ -249,8 +249,17 @@ impl Worker {
                 self.retry_at = None;
             }
 
+            // When every pipeline slot is taken and requests are waiting, the responses sitting
+            // in the bucket are what's blocking new claims. Commit them right away instead of
+            // waiting for the bucket to fill or its deadline to pass: otherwise, when most slots
+            // are held by slow requests, each round of the few remaining slots waits out the
+            // whole deadline.
+            let pipeline_blocked = self.queue_maybe_nonempty
+                && self.in_flight >= MAX_IN_FLIGHT
+                && !self.bucket.is_empty();
             let bucket_ready = self.bucket.len() >= RESPONSE_BUCKET_SIZE
-                || self.bucket_deadline.is_some_and(|d| now >= d);
+                || self.bucket_deadline.is_some_and(|d| now >= d)
+                || pipeline_blocked;
             let can_claim = self.queue_maybe_nonempty && self.in_flight < MAX_IN_FLIGHT;
             let ttl_due = self.ttl_due(now);
 
