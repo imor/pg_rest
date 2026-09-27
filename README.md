@@ -179,11 +179,17 @@ cargo pgrx test pg18      # #[pg_test]s: URL encoding, enqueueing, request valid
 `cargo pgrx regress` needs `shared_preload_libraries = 'pg_rest'` in `~/.pgrx/data-NN/postgresql.conf`.
 You can also run `pg_regress --use-existing` against any cluster that preloads pg_rest.
 
+**Mock HTTP server.** The tests and benchmarks send requests to `mock_server/`, a small Rust
+server with pg_net's nginx test endpoints (including deliberately malformed responses). It's a
+workspace member: `cargo run -p mock_server --release`. `tests/mock_server.py` is the original
+Python version. It serves the same endpoints and needs nothing but Python, but it becomes the
+bottleneck in benchmarks.
+
 **End-to-end tests.** They live in [tests/](tests), ported from pg_net's pytest suite, and need a
 running cluster with pg_rest preloaded plus the mock HTTP server:
 
 ```sh
-python3 tests/mock_server.py &           # pg_net's nginx test endpoints on :8080 (and [::1]:8888)
+cargo run -p mock_server --release &    # pg_net's nginx test endpoints on :8080 (and [::1]:8888)
 PGHOST=127.0.0.1 PGPORT=5432 PGUSER=postgres \
   uv run --with pytest --with 'psycopg[binary]' --with sqlalchemy pytest tests
 ```
@@ -191,7 +197,7 @@ PGHOST=127.0.0.1 PGPORT=5432 PGUSER=postgres \
 **Benchmark against pg_net.** This needs a cluster with `shared_preload_libraries = 'pg_net, pg_rest'`:
 
 ```sh
-python3 tests/mock_server.py --port 8090 --ipv6-port 8891 &
+cargo run -p mock_server --release -- --port 8090 --ipv6-port 8891 &
 uv run --with 'psycopg[binary]' python bench/bench.py --dsn 'host=127.0.0.1 port=5432 user=postgres dbname=postgres' -n 10000
 uv run --with 'psycopg[binary]' --with psutil python bench/cpu_bench.py --dsn 'host=127.0.0.1 port=5432 user=postgres dbname=postgres'
 ```
@@ -234,7 +240,9 @@ How to read the table:
 - **pg_net, with slow requests.** Every batch that contains a slow request waits for it before
   committing, and the transaction stays open for the whole 2 s.
 - **pg_rest up to 1% slow.** The total time is about one slow request. The fast requests keep
-  36k–48k req/s. That figure is probably limited by the single-threaded Python mock server.
+  36k–48k req/s. That ceiling is inside pg_rest's request path, not the mock server: replacing
+  the Python mock server with a Rust one barely changed it (see
+  [bench/benchmarks.md](bench/benchmarks.md)).
 - **pg_rest at 10% slow.** 1,000 slow requests × 2 s need 2,000 slot-seconds, which is
   about 2 s at `MAX_IN_FLIGHT` = 1000, so fast requests start waiting for free slots. For
   workloads that are mostly slow, raising `MAX_IN_FLIGHT` is the lever. Its cost is memory for

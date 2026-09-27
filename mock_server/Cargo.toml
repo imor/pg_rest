@@ -1,0 +1,10 @@
+[package]
+name = "mock_server"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "HTTP server with pg_net's test endpoints, for pg_rest's tests and benchmarks"
+
+[dependencies]
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "io-util", "time", "macros"] }
+httparse = "1.10.1"

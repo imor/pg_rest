@@ -17,7 +17,7 @@ Scenarios, run for each extension in turn:
           throughput.
 
 Requirements: a cluster with `shared_preload_libraries = 'pg_net, pg_rest'`, and the mock server
-(tests/mock_server.py) running.
+(`cargo run -p mock_server --release`, or tests/mock_server.py) running.
 
 Usage:
   uv run --with 'psycopg[binary]' --with psutil python bench/cpu_bench.py \

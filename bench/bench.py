@@ -2,7 +2,7 @@
 Throughput/latency benchmark: pg_rest vs pg_net.
 
 Both extensions are installed in the same database and send requests to the same mock server
-(tests/mock_server.py). For each scenario, N requests are enqueued in one transaction, of which a
+(`cargo run -p mock_server --release`, or tests/mock_server.py). For each scenario, N requests are enqueued in one transaction, of which a
 fraction go to a slow endpoint. The benchmark then polls the response table and records when
 each response becomes visible, i.e. when the worker committed it. Latency is measured from the
 enqueue commit to visibility, which is what a caller polling for its response observes.

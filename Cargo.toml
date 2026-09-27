@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "mock_server"]
+
 [package]
 name = "pg_rest"
 version = "0.1.0"

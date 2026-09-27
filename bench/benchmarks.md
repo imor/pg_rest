@@ -32,7 +32,7 @@ Columns:
 
 Every run completed all 10,000 requests with zero errors.
 
-Run-to-run noise: pg_rest's no-slow-request throughput varied between about 32k and 48k req/s across runs. At that rate the single-threaded Python mock server is probably the bottleneck, so treat those numbers as a lower bound.
+Run-to-run noise: pg_rest's no-slow-request throughput varied between about 32k and 48k req/s across runs. Sections 1–5 used the Python mock server. Replacing it with a Rust one barely changed the numbers (see "Mock server: Python vs Rust" below), so the ceiling is in pg_rest, not in the mock server.
 
 ## 1. Default configurations
 
@@ -246,6 +246,58 @@ pause still help. But a large share of the headroom comes from committing respon
 The baseline's steady-rate CPU (442 ms per 1k) is higher than in earlier sections (334–389 ms).
 The steady scenario varies noticeably between runs; compare the two columns of this table rather
 than figures across sections.
+
+## Mock server: Python vs Rust
+
+`mock_server/` is a Rust port of `tests/mock_server.py`, with the same endpoints including the
+deliberately malformed ones. The full pytest suite passes against it (81/81). Both servers ran
+on `main`, back to back, on the same cluster and build.
+
+| slow | mock server | total | req/s | fast req/s | p50 | fast p99 |
+|---|---|---:|---:|---:|---:|---:|
+| 0% | Python | 0.26 s | 38,614 | 40,574 | 0.17 s | 0.25 s |
+| 0% | Rust | 0.23 s | 43,387 | 45,879 | 0.13 s | 0.22 s |
+| 0.1% | Python | 2.26 s | 4,432 | 50,328 | 0.12 s | 0.20 s |
+| 0.1% | Rust | 2.21 s | 4,518 | 48,831 | 0.13 s | 0.20 s |
+| 1% | Python | 2.25 s | 4,448 | 48,371 | 0.13 s | 0.20 s |
+| 1% | Rust | 2.25 s | 4,447 | 48,417 | 0.13 s | 0.20 s |
+| 10% | Python | 4.09 s | 2,446 | 4,423 | 0.12 s | 1.44 s |
+| 10% | Rust | 4.08 s | 2,448 | 4,420 | 0.12 s | 1.39 s |
+
+pg_rest's worker CPU per 1k requests was the same with both servers: 43–46 ms on bursts and
+406–439 ms at a steady 100 req/s.
+
+pg_net against the Rust server was also unchanged:
+
+| slow | total | req/s | CPU per 1k requests |
+|---|---:|---:|---:|
+| 0% | 50.4 s | 199 | 119 ms (burst) |
+| 0.1% | 70.3 s | 142 | – |
+| 1% | 150.7 s | 66 | 125 ms (burst) |
+| 10% | 150.7 s | 66 | – |
+
+At a steady 100 req/s, pg_net used 142 ms per 1k requests. Its numbers are set by its 1 s pause
+and its batching, not by the server.
+
+**The mock server was not the bottleneck.** The Rust server made fast bursts about 12% faster
+(0.26 → 0.23 s) and changed nothing else. During 40k-request bursts:
+
+| HTTP_WORKER_THREADS | throughput | pg_rest worker CPU | mock server CPU |
+|---:|---:|---:|---:|
+| 2 (default) | 50–53k req/s | ~245% of a core | ~90% of one of 12 cores |
+| 4 (temporary change) | ~47k req/s | 280–310% | 125–140% |
+
+- **The limit is inside pg_rest's request path.** With two tokio threads plus its main thread,
+  the worker uses about 2.5 cores.
+- **More HTTP threads don't help.** Twice the tokio threads used more CPU for slightly less
+  throughput, so their number isn't the limit.
+- **Likely candidates:** the worker's single main thread, which spawns every request and handles
+  every response, or lock contention in reqwest/hyper's per-host connection pool. More threads
+  making it slower fits the latter.
+- **Postgres commits aren't the limit either:** the `no-tables` branch, which commits nothing,
+  hits about the same ceiling.
+- **Not profiled.** Pinning it down would need a profiler (e.g. Instruments or `samply`) on the
+  worker.
 
 ## Takeaways
 
