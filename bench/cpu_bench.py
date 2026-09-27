@@ -31,7 +31,7 @@ import time
 import psutil
 import psycopg
 
-from bench import EXTENSIONS
+from bench import EXTENSIONS, clear, count_responses
 
 
 def worker_process(conn, ext):
@@ -50,13 +50,11 @@ def cpu_seconds(proc):
 
 
 def reset(conn, ext):
-    meta = EXTENSIONS[ext]
-    conn.execute(f"truncate {meta['responses']}")
-    conn.execute(f"delete from {meta['queue']}")
+    clear(conn, EXTENSIONS[ext])
 
 
 def response_count(conn, ext):
-    return conn.execute(f"select count(*) from {EXTENSIONS[ext]['responses']}").fetchone()[0]
+    return count_responses(conn, EXTENSIONS[ext])
 
 
 def wait_for_responses(conn, ext, n, timeout):

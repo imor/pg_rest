@@ -30,9 +30,6 @@ pub const RESPONSE_TTL: &str = "6 hours";
 /// How often expired responses are deleted.
 pub const TTL_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Maximum number of expired responses deleted per cleanup.
-pub const TTL_CLEANUP_BATCH: i32 = 1000;
-
 /// Upper bound on a request's `timeout_milliseconds`. Requests outside `1..=MAX_TIMEOUT_MS` are
 /// not sent and get an error response instead. pg_net equivalent: `pg_net.max_timeout_ms`.
 pub const MAX_TIMEOUT_MS: i32 = 600_000;
@@ -60,9 +57,6 @@ pub const STALE_CONNECTION_RETRIES: u32 = 1;
 /// interrupts, config reloads and TTL cleanup can be delayed.
 pub const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-/// How long to wait before retrying when the extension's tables are locked by another session.
-pub const LOCKED_RETRY_INTERVAL: Duration = Duration::from_millis(100);
-
 /// On `worker_restart()`, how long in-flight requests get to finish before the worker exits.
 /// Requests that don't finish are sent again by the next worker.
 pub const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
@@ -72,3 +66,17 @@ pub const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Seconds the postmaster waits before restarting the worker after it exits.
 pub const WORKER_RESTART_TIME: Duration = Duration::from_secs(1);
+
+/// Maximum number of queued (pending or in-flight) requests held in shared memory. A transaction
+/// that would exceed it fails with "request queue is full".
+pub const QUEUE_CAPACITY: usize = 1 << 18;
+
+/// Number of response slots in shared memory. A new response evicts the older response in its
+/// slot, so roughly the most recent `RESPONSE_CAPACITY` responses are kept.
+pub const RESPONSE_CAPACITY: usize = 1 << 18;
+
+/// How long responses are kept in memory. The in-memory equivalent of `RESPONSE_TTL`.
+pub const RESPONSE_TTL_SECONDS: i64 = 6 * 60 * 60;
+
+/// Response slots examined per TTL cleanup pass.
+pub const TTL_SCAN_WINDOW: usize = 16 * 1024;

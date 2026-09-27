@@ -247,6 +247,112 @@ The baseline's steady-rate CPU (442 ms per 1k) is higher than in earlier section
 The steady scenario varies noticeably between runs; compare the two columns of this table rather
 than figures across sections.
 
+## 7. No tables: shared memory behind views (branch `no-tables`)
+
+Branch `no-tables` (cut from `main`) removes both tables. Section 6 is on branch
+`subxact-retire`.
+
+### Design
+
+- **Storage.** Requests and responses live in one named dynamic shared memory segment (PG 17+
+  `GetNamedDSMSegment`), with variable-length data (URLs, headers, bodies) in a DSA area. PG 18
+  only on this branch.
+  - Request and response slots are indexed by `id % capacity`, with 262,144 of each (about 21 MB
+    of fixed shared memory).
+  - A ring of committed request ids gives the claim order.
+  - One LWLock protects all of it.
+- **Views.** `rest.http_request_queue` and `rest._http_response` are views over functions that
+  read that memory.
+  - `DELETE` works through `INSTEAD OF` triggers.
+  - `INSERT`, `UPDATE` and `TRUNCATE` don't work.
+  - `_http_collect_response` uses a direct lookup by id.
+  - `rest._response_count()` returns the number of stored responses without reading them.
+- **Enqueue.** `http_get` and friends buffer requests in session memory. The buffered requests
+  are published at pre-commit, or dropped on rollback, including rollback to a savepoint. The
+  queue view shows the session's own uncommitted requests, as a table would.
+- **Worker.** It runs no SQL and no transactions. Each response is stored as soon as it arrives,
+  since there's no commit cost to batch away. Pipelining and `MAX_IN_FLIGHT` = 1000 are
+  unchanged.
+- **Capacity.** At most 262,144 requests can be queued; beyond that, the enqueuing transaction
+  fails with "request queue is full". The response store keeps roughly the most recent 262,144
+  responses: a new response evicts the older one in its slot. The 6 h TTL still applies.
+- **Durability: none.** A Postgres restart loses every queued request and stored response.
+  Tables survive a clean restart, and logged tables (`main`'s default) survive a crash.
+
+Both builds used the default release profile (fat LTO), and both ran the same benchmark scripts
+on freshly created extensions. The scripts use `DELETE` instead of `TRUNCATE` on views, and
+`_response_count()` where it exists.
+
+### Throughput and latency (10k requests)
+
+`enqueue s` is the time to run the one transaction that enqueues all 10,000 requests. The other
+columns start from its commit.
+
+| slow | build | enqueue | total | req/s | fast req/s | p50 | fast p99 | max xact |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| 0% | main | 0.45 s | 0.26 s | 38,451 | 40,395 | 0.17 s | 0.25 s | 0 |
+| 0% | no-tables | 0.04 s | 0.27 s | 36,406 | 37,912 | 0.16 s | 0.26 s | 0 |
+| 0.1% | main | 0.44 s | 2.23 s | 4,488 | 50,429 | 0.12 s | 0.20 s | 0 |
+| 0.1% | no-tables | 0.03 s | 2.20 s | 4,544 | 53,770 | 0.10 s | 0.19 s | 0 |
+| 1% | main | 0.45 s | 2.24 s | 4,460 | 50,423 | 0.12 s | 0.20 s | 0 |
+| 1% | no-tables | 0.03 s | 2.21 s | 4,521 | 48,591 | 0.12 s | 0.20 s | 0 |
+| 10% | main | 0.45 s | 4.10 s | 2,439 | 4,404 | 0.11 s | 1.38 s | 0 |
+| 10% | no-tables | 0.03 s | **2.21 s** | 4,517 | **44,293** | 0.12 s | **0.20 s** | 0 |
+
+### CPU, WAL and memory
+
+| | main | no-tables |
+|---|---:|---:|
+| CPU per 1k requests, burst, 0% slow | 45 ms | 42 ms |
+| CPU per 1k requests, burst, 1% slow | 44 ms | 44 ms |
+| CPU per 1k requests, steady 100 req/s | 433 ms | 221 ms |
+| Idle worker CPU (share of a core) | 0.3% | 0.0% |
+| WAL for one 10k burst | 9.2 MB | 0–340 kB (none from pg_rest)¹ |
+| Worker RSS after the runs | 136 MB | 140 MB |
+| Fixed shared memory | – | ~21 MB, plus a DSA area that grows with stored payloads |
+
+¹ The `no-tables` worker writes nothing. One run measured 0 bytes and the other 340 kB, which
+must come from other activity in the cluster.
+
+### What the numbers say
+
+- **Enqueueing is 13–15× cheaper** (0.45 s → 0.03 s for 10k `http_get`s). This is the cost a
+  caller pays inside their own transaction: no row insert, no index update, no WAL.
+- **Worker CPU halves at a steady low rate** (433 → 221 ms per 1k requests), and idle CPU drops
+  to zero. Without tables, the per-transaction overhead that dominates the steady-rate case
+  (sections 3 and 5) is gone. On bursts the worker's CPU is the same, because HTTP and response
+  handling dominate there.
+- **Throughput with few slow requests is unchanged** (0–1% slow). Both builds are limited by the
+  HTTP side and the mock server, not by storage.
+- **WAL drops to nothing.** 9.2 MB per 10k requests (logged tables) becomes 0.
+- **Most of the 10%-slow win is not about tables.** It comes from storing each response
+  immediately instead of waiting up to `RESPONSE_BUCKET_MAX_WAIT` (50 ms) to fill a bucket.
+  - Sampling `main`'s queue every 50 ms during that run showed the following. After ~0.3 s all
+    1,000 slots were busy, mostly with slow requests, and ~900 fast requests were still waiting.
+    The few slots still cycling produced too few responses to fill a bucket, so each bucket
+    waited out its 50 ms deadline. The waiting count shrank only ~10% per 50 ms (900 → 27 over
+    1.7 s), and requests claimed late formed a second wave of slow requests, ending at ~4.1 s.
+  - `no-tables` frees a slot the moment its response arrives, so everything is claimed in the
+    first ~0.3 s and finishes with the first wave, at 2.2 s.
+  - `main` could get most of this with tables too: commit the bucket immediately whenever the
+    pipeline is full and requests are waiting, instead of waiting for the deadline. That wasn't
+    measured here.
+
+### What is lost without tables
+
+- **Durability.** Everything is lost on restart, including a crash. This is the main cost.
+- **Capacity.** There are fixed limits: requests fail beyond 262,144 queued, and old responses
+  are evicted beyond 262,144 stored.
+- **SQL on the data.** The views support `SELECT` and `DELETE` only. There's no `INSERT`,
+  `UPDATE` or `TRUNCATE`, no indexes (queries on the views scan every slot), and no table
+  statistics.
+- **Tests.** The ported pg_net suite passes 70 of 81 tests. The 11 failures all depend on
+  tables: TTL tests that edit `created`, direct `INSERT`s into the queue, `TRUNCATE`,
+  `pg_stat_user_tables`/autoanalyze checks, and requests surviving a postmaster crash.
+- **Commit window.** Requests are published at pre-commit, so in the rare case that a commit
+  fails after that point, they are sent anyway.
+- **Version support.** PG 18 only, as written. The DSM registry needs PG 17+.
+
 ## Takeaways
 
 **Pipelining beats batching even without pg_net's pause.** Section 2 removes pg_net's 1 s pause.
@@ -267,6 +373,11 @@ is the "1 s, 200 in flight" row in section 3. It matches pg_net with no slow req
 **Committing responses in buckets matters as much as pipelining.** With a bucket of 1, one
 transaction per response, pg_rest is 14× slower on fast bursts and uses 9× more CPU per request
 (section 5).
+
+**No tables: a cheaper enqueue and half the steady-rate CPU, at the cost of durability.** With
+shared memory behind views, enqueueing is ~14× cheaper, steady-rate worker CPU halves, and WAL
+disappears. Burst throughput is the same. The 10%-slow speed-up comes mostly from not waiting on
+the bucket deadline, which `main` could fix separately (section 7).
 
 **A 50 ms pause does not reduce steady-rate CPU at 100 req/s.** The steady benchmark enqueues a
 batch every 100 ms. A 50 ms pause is shorter than that gap, so pg_rest still commits about twice

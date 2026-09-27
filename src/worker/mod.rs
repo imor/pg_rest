@@ -41,10 +41,10 @@ use tokio::sync::mpsc::{self, UnboundedReceiver};
 
 use crate::consts::*;
 use crate::shmem::{self, WorkerStatus};
-use db::{Claimed, ExtensionTables, Plans, TickWork};
+use db::Claimed;
 use http::Http;
 use notify::WakeReceiver;
-use types::HttpResponse;
+use types::{HttpResponse, Outcome};
 
 const WORKER_NAME: &str = concat!("pg_rest ", env!("CARGO_PKG_VERSION"), " worker");
 const APP_NAME: &str = concat!("pg_rest ", env!("CARGO_PKG_VERSION"));
@@ -166,7 +166,6 @@ struct Worker {
     http: Http,
     responses: UnboundedReceiver<HttpResponse>,
     wake: WakeReceiver,
-    plans: Option<Plans>,
 
     /// Requests claimed but not yet retired. Includes responses sitting in the bucket.
     in_flight: usize,
@@ -181,11 +180,6 @@ struct Worker {
     queue_maybe_nonempty: bool,
     /// Whether claims left behind by a previous worker still need to be reset.
     needs_claim_reset: bool,
-    /// OID of the queue table the in-flight requests were claimed from.
-    queue_oid: Option<pg_sys::Oid>,
-    /// Bumped when in-flight requests are abandoned (the extension was dropped or recreated), so
-    /// that their responses are ignored when they arrive.
-    generation: u64,
 
     last_ttl_cleanup: Option<Instant>,
     /// Set when the extension's tables were locked; nothing is attempted before then.
@@ -214,14 +208,11 @@ impl Worker {
             http,
             responses,
             wake,
-            plans: None,
             in_flight: 0,
             bucket: Vec::with_capacity(RESPONSE_BUCKET_SIZE),
             bucket_deadline: None,
             queue_maybe_nonempty: true,
             needs_claim_reset: true,
-            queue_oid: None,
-            generation: 0,
             last_ttl_cleanup: None,
             retry_at: None,
             reported_running: false,
@@ -249,8 +240,9 @@ impl Worker {
                 self.retry_at = None;
             }
 
-            let bucket_ready = self.bucket.len() >= RESPONSE_BUCKET_SIZE
-                || self.bucket_deadline.is_some_and(|d| now >= d);
+            // Without tables there is no per-commit cost to amortize, so responses are stored
+            // as soon as they arrive.
+            let bucket_ready = !self.bucket.is_empty();
             let can_claim = self.queue_maybe_nonempty && self.in_flight < MAX_IN_FLIGHT;
             let ttl_due = self.ttl_due(now);
 
@@ -295,9 +287,6 @@ impl Worker {
         // below triggers a new wake instead of being missed until the next timeout.
         self.wake.drain();
         while let Ok(response) = self.responses.try_recv() {
-            if response.generation != self.generation {
-                continue; // claimed from a table that no longer exists
-            }
             self.add_to_bucket(response);
         }
     }
@@ -314,120 +303,67 @@ impl Worker {
             .is_none_or(|t| now.duration_since(t) >= TTL_CLEANUP_INTERVAL)
     }
 
-    /// One short transaction: retire up to a bucket of responses, claim requests for the free
-    /// slots, and occasionally delete expired responses.
+    /// Stores every response that has arrived, claims requests for the free slots, and
+    /// occasionally expires old responses. All in shared memory; no transaction.
     fn tick(&mut self, now: Instant, ttl_due: bool) {
-        let retire_count = self.bucket.len().min(RESPONSE_BUCKET_SIZE);
-
-        let result = db::transaction(|| match db::lock_extension_tables() {
-            ExtensionTables::Missing => TickResult::Missing,
-            ExtensionTables::Locked => TickResult::Locked,
-            ExtensionTables::Present { queue } => {
-                let recreated = self.queue_oid.is_some_and(|oid| oid != queue);
-                if recreated {
-                    // The in-flight requests were claimed from a table that is gone. Their ids
-                    // mean nothing in the new table.
-                    self.abandon_in_flight();
-                }
-                self.queue_oid = Some(queue);
-
-                let retire: &[HttpResponse] = if recreated {
-                    &[]
-                } else {
-                    &self.bucket[..retire_count]
-                };
-                let free_slots = MAX_IN_FLIGHT - (self.in_flight - retire.len());
-                let claim = if self.queue_maybe_nonempty {
-                    free_slots
-                } else {
-                    0
-                };
-
-                let claimed = db::run_tick(
-                    &mut self.plans,
-                    TickWork {
-                        // A new table has no stale claims.
-                        reset_claims: self.needs_claim_reset && !recreated,
-                        retire,
-                        claim,
-                        delete_expired: ttl_due,
-                    },
-                );
-                TickResult::Done {
-                    retired: retire.len(),
-                    asked: claim,
-                    claimed,
-                }
+        if self.needs_claim_reset {
+            let n = crate::mem::reset_claims();
+            if n > 0 {
+                log!("pg_rest worker: re-queued {n} requests claimed by a previous worker");
             }
-        });
+            self.needs_claim_reset = false;
+        }
 
-        match result {
-            TickResult::Missing => {
-                if self.in_flight > 0 {
-                    warning!(
-                        "pg_rest worker: extension was dropped, discarding {} in-flight requests",
-                        self.in_flight
-                    );
-                }
-                self.abandon_in_flight();
-                self.queue_oid = None;
-                self.needs_claim_reset = false;
+        let retired = self.bucket.len();
+        if retired > 0 {
+            let encoded: Vec<_> = self
+                .bucket
+                .drain(..)
+                .map(|r| (r.id, r.generation, stored_response(&r.outcome).encode()))
+                .collect();
+            crate::mem::retire(&encoded);
+            self.in_flight -= retired;
+            self.bucket_deadline = None;
+        }
+
+        if self.queue_maybe_nonempty && self.in_flight < MAX_IN_FLIGHT {
+            let asked = MAX_IN_FLIGHT - self.in_flight;
+            let (generation, claimed) = crate::mem::claim(asked);
+            if claimed.len() < asked {
                 self.queue_maybe_nonempty = false;
-                self.last_ttl_cleanup = Some(now);
             }
-            TickResult::Locked => {
-                debug1!("pg_rest worker: extension tables are locked, retrying");
-                self.retry_at = Some(now + LOCKED_RETRY_INTERVAL);
-            }
-            TickResult::Done {
-                retired,
-                asked,
-                claimed,
-            } => {
-                self.needs_claim_reset = false;
-                if ttl_due {
-                    self.last_ttl_cleanup = Some(now);
-                }
-
-                self.bucket.drain(..retired);
-                self.in_flight -= retired;
-                if self.bucket.is_empty() {
-                    self.bucket_deadline = None;
-                }
-
-                if claimed.len() < asked {
-                    self.queue_maybe_nonempty = false;
-                }
-
-                // Send only after the claims are committed.
-                self.in_flight += claimed.len();
-                for c in claimed {
-                    match c {
-                        Claimed::Send(request) => self.http.send(request, self.generation),
-                        Claimed::Rejected(id, outcome) => self.add_to_bucket(HttpResponse {
-                            id,
-                            generation: self.generation,
-                            outcome,
-                        }),
-                    }
-                }
-
-                if retired > 0 || asked > 0 || ttl_due {
-                    // Background workers must flush their own table stats (PR #254 in pg_net).
-                    // Rate-limited internally when not forced.
-                    unsafe { pg_sys::pgstat_report_stat(false) };
-                    self.stats_pending = true;
+            self.in_flight += claimed.len();
+            for (id, payload) in claimed {
+                let q = crate::mem::QueuedRequest::decode(&payload);
+                let headers = q
+                    .headers
+                    .and_then(|h| serde_json::from_str(&h).ok())
+                    .map(pgrx::JsonB);
+                match db::to_request(
+                    id,
+                    &q.method,
+                    q.url,
+                    q.timeout_milliseconds,
+                    headers,
+                    q.body,
+                ) {
+                    Claimed::Send(request) => self.http.send(request, generation),
+                    Claimed::Rejected(id, outcome) => self.add_to_bucket(HttpResponse {
+                        id,
+                        generation,
+                        outcome,
+                    }),
                 }
             }
         }
-    }
 
-    /// Forgets all in-flight requests. Responses already in flight are ignored when they arrive.
-    fn abandon_in_flight(&mut self) {
-        self.generation += 1;
-        self.in_flight = 0;
-        self.bucket.clear();
-        self.bucket_deadline = None;
+        if ttl_due {
+            let n = crate::mem::expire(RESPONSE_TTL_SECONDS * 1_000_000, TTL_SCAN_WINDOW);
+            if n > 0 {
+                debug1!("pg_rest worker: expired {n} responses");
+            }
+            self.last_ttl_cleanup = Some(now);
+        }
     }
 
     fn next_timeout(&self, now: Instant) -> Duration {
@@ -504,12 +440,32 @@ impl Worker {
     }
 }
 
-enum TickResult {
-    Missing,
-    Locked,
-    Done {
-        retired: usize,
-        asked: usize,
-        claimed: Vec<Claimed>,
-    },
+/// The shared-memory form of a response: the columns of the old `_http_response` table.
+fn stored_response(outcome: &Outcome) -> crate::mem::StoredResponse {
+    match outcome {
+        Outcome::Success {
+            status_code,
+            headers,
+            content_type,
+            body,
+        } => crate::mem::StoredResponse {
+            status_code: Some(*status_code),
+            content_type: content_type.clone(),
+            headers: Some(serde_json::Value::Object(headers.clone()).to_string()),
+            content: body.clone(),
+            timed_out: Some(false),
+            error_msg: None,
+        },
+        Outcome::Failure {
+            timed_out,
+            error_msg,
+        } => crate::mem::StoredResponse {
+            status_code: None,
+            content_type: None,
+            headers: None,
+            content: None,
+            timed_out: Some(*timed_out),
+            error_msg: Some(error_msg.clone()),
+        },
+    }
 }

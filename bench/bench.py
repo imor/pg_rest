@@ -42,6 +42,33 @@ EXTENSIONS = {
 }
 
 
+def clear(conn, meta):
+    """Empties the extension's response table and request queue. Views (the no-tables build)
+    can't be truncated, so fall back to DELETE."""
+    try:
+        conn.execute(f"truncate {meta['responses']}")
+    except psycopg.errors.WrongObjectType:
+        conn.execute(f"delete from {meta['responses']}")
+    conn.execute(f"delete from {meta['queue']}")
+
+
+def count_responses(conn, meta):
+    """Number of visible responses. Uses rest._response_count() where it exists (the no-tables
+    build), since count(*) over its view would read every stored response."""
+    if meta.get("has_count_fn") is None:
+        meta["has_count_fn"] = (
+            conn.execute(
+                "select count(*) from pg_proc where proname = '_response_count' "
+                "and pronamespace = %s::regnamespace",
+                (meta["schema"],),
+            ).fetchone()[0]
+            > 0
+        )
+    if meta["has_count_fn"]:
+        return conn.execute(f"select {meta['schema']}._response_count()").fetchone()[0]
+    return conn.execute(f"select count(*) from {meta['responses']}").fetchone()[0]
+
+
 def percentile(values, p):
     if not values:
         return float("nan")
@@ -77,14 +104,14 @@ def run_scenario(dsn, ext, url, n, slow_fraction, slow_delay, timeout_s):
     meta = EXTENSIONS[ext]
     schema = meta["schema"]
     with psycopg.connect(dsn, autocommit=True) as conn:
-        conn.execute(f"truncate {meta['responses']}")
-        conn.execute(f"delete from {meta['queue']}")
+        clear(conn, meta)
 
         slow_every = round(1 / slow_fraction) if slow_fraction > 0 else 0
         sampler = XactSampler(dsn, meta["backend"])
         sampler.start()
 
         # Enqueue everything in one transaction; the commit wakes the worker.
+        e0 = time.monotonic()
         with conn.transaction():
             conn.execute(
                 f"""
@@ -98,13 +125,14 @@ def run_scenario(dsn, ext, url, n, slow_fraction, slow_delay, timeout_s):
                 {"slow_every": slow_every, "url": url, "delay": slow_delay, "n": n},
             )
         t0 = time.monotonic()
+        enqueue_s = t0 - e0
 
         # Poll visibility: record the time at which each response count was first seen.
         seen = 0
         arrivals = []
         deadline = t0 + timeout_s
         while seen < n and time.monotonic() < deadline:
-            count = conn.execute(f"select count(*) from {meta['responses']}").fetchone()[0]
+            count = count_responses(conn, meta)
             now = time.monotonic() - t0
             if count > seen:
                 arrivals.extend([now] * (count - seen))
@@ -132,6 +160,7 @@ def run_scenario(dsn, ext, url, n, slow_fraction, slow_delay, timeout_s):
         "errors": errors,
         "total_s": total,
         "throughput": seen / total if total > 0 else 0,
+        "enqueue_s": enqueue_s,
         # Throughput of the fast requests alone: how many completed by the time the last of
         # them did. Unlike `throughput`, not dominated by the slow requests' tail.
         "fast_throughput": len(fast) / fast[-1] if fast and fast[-1] > 0 else 0,
@@ -161,7 +190,7 @@ def main():
         time.sleep(2)
 
     print(
-        f"{'scenario':<22} {'ext':<8} {'done':>6} {'errors':>6} {'total s':>8} {'req/s':>8} {'fast req/s':>10} "
+        f"{'scenario':<22} {'ext':<8} {'done':>6} {'errors':>6} {'enqueue s':>9} {'total s':>8} {'req/s':>8} {'fast req/s':>10} "
         f"{'p50 s':>7} {'p99 s':>7} {'fast p99 s':>10} {'max xact s':>10}"
     )
     for fraction in [float(f) for f in args.slow_fractions.split(",")]:
@@ -170,7 +199,7 @@ def main():
             r = run_scenario(args.dsn, ext, args.url, args.n, fraction, args.slow_delay, args.timeout)
             print(
                 f"{scenario:<22} {r['ext']:<8} {r['completed']:>6} {r['errors']:>6} "
-                f"{r['total_s']:>8.2f} {r['throughput']:>8.0f} {r['fast_throughput']:>10.0f} {r['p50_s']:>7.2f} "
+                f"{r['enqueue_s']:>9.2f} {r['total_s']:>8.2f} {r['throughput']:>8.0f} {r['fast_throughput']:>10.0f} {r['p50_s']:>7.2f} "
                 f"{r['p99_s']:>7.2f} {r['fast_p99_s']:>10.2f} {r['max_xact_s']:>10.2f}",
                 flush=True,
             )

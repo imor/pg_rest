@@ -9,10 +9,32 @@ use serde_json::Value;
 
 use crate::shmem::{self, WorkerStatus};
 
-const ENQUEUE_SQL: &str = "
-    insert into rest.http_request_queue(method, url, headers, body, timeout_milliseconds)
-    values ($1, $2, $3, convert_to($4::text, 'UTF8'), $5)
-    returning id";
+/// A request made in the current transaction, published to shared memory when it commits.
+struct PendingRequest {
+    id: i64,
+    /// Subtransaction that made it, so that rolling back to a savepoint can drop it.
+    subxact: pg_sys::SubTransactionId,
+    payload: Vec<u8>,
+}
+
+thread_local! {
+    static PENDING: std::cell::RefCell<Vec<PendingRequest>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Drops requests made in an aborted subtransaction. Subtransaction ids only grow, and the
+/// aborting subtransaction is the innermost open one, so everything it (or any subtransaction
+/// started inside it) made has an id >= its own.
+#[pg_guard]
+unsafe extern "C-unwind" fn drop_on_subxact_abort(
+    event: pg_sys::SubXactEvent::Type,
+    my_subid: pg_sys::SubTransactionId,
+    _parent: pg_sys::SubTransactionId,
+    _arg: *mut c_void,
+) {
+    if event == pg_sys::SubXactEvent::SUBXACT_EVENT_ABORT_SUB {
+        PENDING.with_borrow_mut(|p| p.retain(|r| r.subxact < my_subid));
+    }
+}
 
 /// Whether `wake_at_commit` has been registered in this backend.
 static WAKE_CALLBACK_REGISTERED: AtomicBool = AtomicBool::new(false);
@@ -26,6 +48,21 @@ static WAKE_AT_COMMIT: AtomicBool = AtomicBool::new(false);
 unsafe extern "C-unwind" fn wake_at_commit(event: pg_sys::XactEvent::Type, _arg: *mut c_void) {
     use pg_sys::XactEvent::*;
     match event {
+        // Publish the transaction's requests. An error here (queue full) aborts the transaction.
+        XACT_EVENT_PRE_COMMIT => {
+            let pending = PENDING.with_borrow_mut(std::mem::take);
+            if !pending.is_empty() {
+                let requests: Vec<_> = pending.into_iter().map(|r| (r.id, r.payload)).collect();
+                if let Err(e) = crate::mem::enqueue(&requests) {
+                    error!("could not queue {} pg_rest requests: {e}", requests.len());
+                }
+            }
+        }
+        XACT_EVENT_PRE_PREPARE => {
+            if PENDING.with_borrow(|p| !p.is_empty()) {
+                error!("cannot PREPARE a transaction that made pg_rest requests");
+            }
+        }
         XACT_EVENT_COMMIT | XACT_EVENT_PARALLEL_COMMIT => {
             if WAKE_AT_COMMIT.swap(false, Ordering::Relaxed) {
                 let state = shmem::state();
@@ -43,6 +80,7 @@ unsafe extern "C-unwind" fn wake_at_commit(event: pg_sys::XactEvent::Type, _arg:
         // `rest.wake()` after them, like pg_net.
         XACT_EVENT_PREPARE | XACT_EVENT_ABORT | XACT_EVENT_PARALLEL_ABORT => {
             WAKE_AT_COMMIT.store(false, Ordering::Relaxed);
+            PENDING.with_borrow_mut(Vec::clear);
         }
         _ => {}
     }
@@ -59,7 +97,10 @@ mod rest {
     fn wake() {
         // RegisterXactCallback never deduplicates, so register at most once per backend.
         if !WAKE_CALLBACK_REGISTERED.swap(true, Ordering::Relaxed) {
-            unsafe { pg_sys::RegisterXactCallback(Some(wake_at_commit), std::ptr::null_mut()) };
+            unsafe {
+                pg_sys::RegisterXactCallback(Some(wake_at_commit), std::ptr::null_mut());
+                pg_sys::RegisterSubXactCallback(Some(drop_on_subxact_abort), std::ptr::null_mut());
+            }
         }
         WAKE_AT_COMMIT.store(true, Ordering::Relaxed);
     }
@@ -184,25 +225,189 @@ mod rest {
         body: Option<JsonB>,
         timeout_milliseconds: Option<i32>,
     ) -> i64 {
-        // A NULL url is left to the table's not-null constraint, like pg_net.
-        let url = url.map(|url| encode_url_with_params(url, params.as_ref().map(|p| &p.0)));
+        // Same errors the table's not-null constraints gave on main.
+        let Some(url) = url else {
+            error!("null value in column \"url\" of relation \"http_request_queue\" violates not-null constraint");
+        };
+        let Some(timeout_milliseconds) = timeout_milliseconds else {
+            error!("null value in column \"timeout_milliseconds\" of relation \"http_request_queue\" violates not-null constraint");
+        };
+        let url = encode_url_with_params(url, params.as_ref().map(|p| &p.0));
 
-        let id = Spi::get_one_with_args::<i64>(
-            ENQUEUE_SQL,
-            &[
-                method.into(),
-                url.into(),
-                headers.into(),
-                body.into(),
-                timeout_milliseconds.into(),
-            ],
-        )
-        .unwrap_or_else(|e| error!("failed to enqueue request: {e}"))
-        .expect("insert ... returning id returned no id");
+        // The body is the jsonb's text form, like `convert_to(body::text, 'UTF8')` on main.
+        let body = body.map(|b| {
+            Spi::get_one_with_args::<String>("select $1::text", &[b.into()])
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+                .into_bytes()
+        });
+
+        let request = crate::mem::QueuedRequest {
+            method: method.to_owned(),
+            url,
+            headers: headers.map(|h| h.0.to_string()),
+            body,
+            timeout_milliseconds,
+        };
+        let id = crate::mem::next_id();
+        let subxact = unsafe { pg_sys::GetCurrentSubTransactionId() };
+        PENDING.with_borrow_mut(|p| {
+            p.push(PendingRequest {
+                id,
+                subxact,
+                payload: request.encode(),
+            })
+        });
 
         wake();
 
         id
+    }
+
+    type ResponseRow = (
+        i64,
+        Option<i32>,
+        Option<String>,
+        Option<JsonB>,
+        Option<String>,
+        Option<bool>,
+        Option<String>,
+        TimestampWithTimeZone,
+    );
+
+    fn response_row(row: crate::mem::ResponseRow) -> ResponseRow {
+        let r = crate::mem::StoredResponse::decode(&row.payload);
+        (
+            row.id,
+            r.status_code,
+            r.content_type,
+            r.headers
+                .and_then(|h| serde_json::from_str(&h).ok())
+                .map(JsonB),
+            r.content,
+            r.timed_out,
+            r.error_msg,
+            timestamp(row.created),
+        )
+    }
+
+    fn timestamp(ts: pg_sys::TimestampTz) -> TimestampWithTimeZone {
+        TimestampWithTimeZone::try_from(ts).unwrap_or_else(|_| error!("invalid timestamp {ts}"))
+    }
+
+    /// Queued (pending or in-flight) requests. Backs the `rest.http_request_queue` view.
+    #[allow(clippy::type_complexity)] // pgrx needs the row type spelled out here
+    #[pg_extern]
+    fn _requests() -> TableIterator<
+        'static,
+        (
+            name!(id, i64),
+            name!(method, String),
+            name!(url, String),
+            name!(headers, Option<JsonB>),
+            name!(body, Option<Vec<u8>>),
+            name!(timeout_milliseconds, i32),
+            name!(claimed_at, Option<TimestampWithTimeZone>),
+        ),
+    > {
+        // Like a table, the view shows this transaction's own not-yet-committed requests too.
+        let own = PENDING.with_borrow(|p| {
+            p.iter()
+                .map(|r| crate::mem::RequestRow {
+                    id: r.id,
+                    claimed_at: None,
+                    payload: r.payload.clone(),
+                })
+                .collect::<Vec<_>>()
+        });
+        let rows: Vec<_> = crate::mem::requests()
+            .into_iter()
+            .chain(own)
+            .map(|row| {
+                let r = crate::mem::QueuedRequest::decode(&row.payload);
+                (
+                    row.id,
+                    r.method,
+                    r.url,
+                    r.headers
+                        .and_then(|h| serde_json::from_str(&h).ok())
+                        .map(JsonB),
+                    r.body,
+                    r.timeout_milliseconds,
+                    row.claimed_at.map(timestamp),
+                )
+            })
+            .collect();
+        TableIterator::new(rows)
+    }
+
+    /// Stored responses. Backs the `rest._http_response` view.
+    #[allow(clippy::type_complexity)] // pgrx needs the row type spelled out here
+    #[pg_extern]
+    fn _responses() -> TableIterator<
+        'static,
+        (
+            name!(id, i64),
+            name!(status_code, Option<i32>),
+            name!(content_type, Option<String>),
+            name!(headers, Option<JsonB>),
+            name!(content, Option<String>),
+            name!(timed_out, Option<bool>),
+            name!(error_msg, Option<String>),
+            name!(created, TimestampWithTimeZone),
+        ),
+    > {
+        let rows: Vec<_> = crate::mem::responses()
+            .into_iter()
+            .map(response_row)
+            .collect();
+        TableIterator::new(rows)
+    }
+
+    /// The stored response to one request (zero or one rows), without scanning them all.
+    #[allow(clippy::type_complexity)] // pgrx needs the row type spelled out here
+    #[pg_extern]
+    fn _response(
+        request_id: i64,
+    ) -> TableIterator<
+        'static,
+        (
+            name!(id, i64),
+            name!(status_code, Option<i32>),
+            name!(content_type, Option<String>),
+            name!(headers, Option<JsonB>),
+            name!(content, Option<String>),
+            name!(timed_out, Option<bool>),
+            name!(error_msg, Option<String>),
+            name!(created, TimestampWithTimeZone),
+        ),
+    > {
+        TableIterator::new(crate::mem::response(request_id).map(response_row))
+    }
+
+    /// Number of stored responses, without reading them.
+    #[pg_extern]
+    fn _response_count() -> i64 {
+        crate::mem::response_count() as i64
+    }
+
+    /// Backs `DELETE` on the `rest.http_request_queue` view.
+    #[pg_extern]
+    fn _delete_request(request_id: i64) -> bool {
+        crate::mem::delete_request(request_id)
+    }
+
+    /// Backs `DELETE` on the `rest._http_response` view.
+    #[pg_extern]
+    fn _delete_response(request_id: i64) -> bool {
+        crate::mem::delete_response(request_id)
+    }
+
+    /// Forgets all queued requests and stored responses.
+    #[pg_extern]
+    fn _clear() {
+        crate::mem::clear();
     }
 }
 

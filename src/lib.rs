@@ -4,6 +4,7 @@ use pgrx::prelude::*;
 
 mod api;
 mod consts;
+mod mem;
 mod schema;
 mod shmem;
 mod worker;

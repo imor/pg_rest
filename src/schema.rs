@@ -1,4 +1,9 @@
-//! Tables, types and SQL functions of the `rest` schema. Modeled on pg_net's `net` schema.
+//! Views, types and SQL functions of the `rest` schema.
+//!
+//! On this branch there are no tables: requests and responses live in shared memory (see
+//! `mem`), and `rest.http_request_queue` / `rest._http_response` are views over functions that
+//! read it. `DELETE` on the views is supported through INSTEAD OF triggers; `TRUNCATE` is not
+//! (views can't be truncated).
 
 use pgrx::prelude::*;
 
@@ -14,37 +19,6 @@ check (
   or value ilike 'post'
   or value ilike 'delete'
 );
-
--- Pending and in-flight requests. The background worker claims rows by setting `claimed_at`, and
--- deletes them in the same transaction that inserts their response.
--- API: Private
-create table rest.http_request_queue(
-    id bigserial primary key,
-    method rest.http_method not null,
-    url text not null,
-    headers jsonb,
-    body bytea,
-    timeout_milliseconds int not null,
-    claimed_at timestamptz
-);
-
--- Keeps claiming fast when many rows are claimed but not yet retired.
-create index http_request_queue_unclaimed_idx on rest.http_request_queue (id) where claimed_at is null;
-
--- Associates a response with a request
--- API: Private
-create table rest._http_response(
-    id bigint,
-    status_code integer,
-    content_type text,
-    headers jsonb,
-    content text,
-    timed_out bool,
-    error_msg text,
-    created timestamptz not null default now()
-);
-
-create index on rest._http_response (created);
 
 -- Lifecycle states of a request (all protocols)
 -- API: Public
@@ -66,6 +40,50 @@ create type rest.http_response_result as (
     response rest.http_response
 );
 
+create function rest.check_worker_is_up() returns void as $$
+begin
+  if not exists (select pid from pg_stat_activity where backend_type ilike '%pg_rest%') then
+    raise exception using
+      message = 'the pg_rest background worker is not up'
+    , detail  = 'the pg_rest background worker is down due to an internal error and cannot process requests'
+    , hint    = 'make sure that you didn''t modify any of pg_rest internal tables';
+  end if;
+end
+$$ language plpgsql;
+comment on function rest.check_worker_is_up() is 'raises an exception if the pg_rest background worker is not up, otherwise it doesn''t return anything';
+"#,
+    name = "bootstrap",
+    bootstrap
+);
+
+extension_sql!(
+    r#"
+-- Pending and in-flight requests, read from shared memory.
+-- API: Private
+create view rest.http_request_queue as select * from rest._requests();
+
+-- Stored responses, read from shared memory.
+-- API: Private
+create view rest._http_response as select * from rest._responses();
+
+create function rest._delete_request_row() returns trigger language plpgsql as $$
+begin
+  perform rest._delete_request(old.id);
+  return old;
+end
+$$;
+create trigger delete_request instead of delete on rest.http_request_queue
+  for each row execute function rest._delete_request_row();
+
+create function rest._delete_response_row() returns trigger language plpgsql as $$
+begin
+  perform rest._delete_response(old.id);
+  return old;
+end
+$$;
+create trigger delete_response instead of delete on rest._http_response
+  for each row execute function rest._delete_response_row();
+
 -- Blocks until an http_request is complete
 -- API: Private
 create function rest._await_response(
@@ -80,8 +98,7 @@ begin
     while rec is null loop
         select *
         into rec
-        from rest._http_response
-        where id = request_id;
+        from rest._response(request_id);
 
         if rec is null then
             -- Wait 50 ms before checking again
@@ -115,8 +132,7 @@ begin
 
     select *
     into rec
-    from rest._http_response
-    where id = request_id;
+    from rest._response(request_id);
 
     if rec is null or rec.error_msg is not null then
         -- The request is either still processing or the request_id provided does not exist
@@ -145,29 +161,13 @@ begin
 end;
 $$;
 
-create function rest.check_worker_is_up() returns void as $$
-begin
-  if not exists (select pid from pg_stat_activity where backend_type ilike '%pg_rest%') then
-    raise exception using
-      message = 'the pg_rest background worker is not up'
-    , detail  = 'the pg_rest background worker is down due to an internal error and cannot process requests'
-    , hint    = 'make sure that you didn''t modify any of pg_rest internal tables';
-  end if;
-end
-$$ language plpgsql;
-comment on function rest.check_worker_is_up() is 'raises an exception if the pg_rest background worker is not up, otherwise it doesn''t return anything';
-"#,
-    name = "bootstrap",
-    bootstrap
-);
-
-extension_sql!(
-    r#"
 comment on function rest.wait_until_running() is 'waits until the worker is running';
 
 grant usage on schema rest to PUBLIC;
-grant all on all sequences in schema rest to PUBLIC;
-grant select, insert, update, delete, truncate, references on all tables in schema rest to PUBLIC;
+grant select, delete on rest.http_request_queue, rest._http_response to PUBLIC;
+
+-- Shared memory outlives the extension: start from a clean slate when it is (re)created.
+select rest._clear();
 "#,
     name = "finalize",
     finalize
