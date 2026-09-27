@@ -43,7 +43,7 @@ EXTENSIONS = {
 
 
 def clear(conn, meta):
-    """Empties the extension's response table and request queue. Views (the no-tables build)
+    """Empties the extension's response table and request queue. Views (the in-memory-tables build)
     can't be truncated, so fall back to DELETE."""
     try:
         conn.execute(f"truncate {meta['responses']}")
@@ -53,7 +53,7 @@ def clear(conn, meta):
 
 
 def count_responses(conn, meta):
-    """Number of visible responses. Uses rest._response_count() where it exists (the no-tables
+    """Number of visible responses. Uses rest._response_count() where it exists (the in-memory-tables
     build), since count(*) over its view would read every stored response."""
     if meta.get("has_count_fn") is None:
         meta["has_count_fn"] = (
