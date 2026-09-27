@@ -247,6 +247,98 @@ The baseline's steady-rate CPU (442 ms per 1k) is higher than in earlier section
 The steady scenario varies noticeably between runs; compare the two columns of this table rather
 than figures across sections.
 
+## 6. Subtransaction per bucket, with a row-by-row fallback
+
+The design proposed in review, on branch `subxact-retire`:
+
+1. Each bucket is stored in a subtransaction.
+2. If storing it fails, for example because a user trigger on `_http_response` raises, the
+   subtransaction is rolled back and the bucket's responses are stored one at a time, each in its
+   own subtransaction.
+3. A response that still fails on its own is dropped with a WARNING, and its request is deleted,
+   so it isn't re-sent forever.
+4. A query cancel (`pg_cancel_backend`) is re-raised rather than treated as a bad row, as
+   PL/pgSQL's `WHEN OTHERS` does.
+
+On `main`, any error while storing a bucket ends the worker, and the postmaster restarts it.
+
+### Normal path (nothing fails)
+
+| slow | build | total | fast req/s | p50 | fast p99 | max xact |
+|---|---|---:|---:|---:|---:|---:|
+| 0% | main | 0.27 s | 39,544 | 0.17 s | 0.25 s | 0.01 s |
+| 0% | subxact-retire | 0.27 s | 38,942 | 0.18 s | 0.26 s | 0.01 s |
+| 1% | main | 2.25 s | 49,514 | 0.12 s | 0.20 s | 0 |
+| 1% | subxact-retire | 2.25 s | 48,406 | 0.13 s | 0.20 s | 0 |
+| 10% | main | 4.10 s | 4,422 | 0.12 s | 1.37 s | 0 |
+| 10% | subxact-retire | 4.10 s | 4,443 | 0.12 s | 1.42 s | 0 |
+
+| CPU per 1k requests | main | subxact-retire |
+|---|---:|---:|
+| burst, 0% slow | 44 ms | 44 ms |
+| burst, 1% slow | 48 ms | 47 ms |
+
+**The subtransaction costs nothing measurable on the normal path**: one extra subtransaction per
+bucket of 100.
+
+### Failure path
+
+`bench/failure_bench.py` adds a `BEFORE INSERT` trigger on `rest._http_response` that raises for
+every request id divisible by N. It then enqueues 10,000 requests and waits up to 60 s for the
+queue to drain.
+
+- **none:** no trigger.
+- **0:** the trigger, which never raises. This isolates the trigger's own cost.
+
+| failing rows | build | queue drained | time | responses stored | worker restarts | CPU per 1k |
+|---|---|---|---:|---:|---:|---:|
+| none | main | yes | 0.21 s | 10,000 | 0 | 46 ms |
+| none | subxact-retire | yes | 0.20 s | 10,000 | 0 | 45 ms |
+| trigger, 0 failing | main | yes | 0.23 s | 10,000 | 0 | 48 ms |
+| trigger, 0 failing | subxact-retire | yes | 0.23 s | 10,000 | 0 | 50 ms |
+| 1 in 1,000 (10 rows) | main | **no** (60 s) | – | 1,300 | **56** | – |
+| 1 in 1,000 (10 rows) | subxact-retire | yes | 0.44 s | 9,990 | 0 | 69 ms |
+| 1 in 100 (100 rows) | main | **no** (60 s) | – | 100 | **56** | – |
+| 1 in 100 (100 rows) | subxact-retire | yes | 2.22 s | 9,900 | 0 | 248 ms |
+| 1 in 10 (1,000 rows) | main | **no** (60 s) | – | 0 | **56** | – |
+| 1 in 10 (1,000 rows) | subxact-retire | yes | 2.16 s | 9,000 | 0 | 240 ms |
+
+**What `main` does is worse than "crash and replay".** The failing bucket aborts, the worker exits,
+and the restarted worker re-sends every claimed request. A bucket containing a bad row fails again
+every time, so the worker restarts about once a second and the queue never drains. In 60 s, at
+most 1,300 of the 10,000 responses were stored, and every request was sent to the remote server
+56 times.
+
+**With the subtransaction, every good response is stored and the worker keeps running.** A
+bucket that has to be retried costs about 20 ms: a 100-row bucket stored one row at a time.
+
+- **1 bad row per 1,000:** 10 buckets were retried, and the run took 0.44 s instead of 0.23 s.
+- **1 per 100, or 1 per 10:** every bucket was retried, and the run took about 2.2 s. That is
+  about the cost of committing every response separately (section 5: 3.9 s), a little cheaper
+  because subtransactions are lighter than transactions.
+
+Things to know about this design:
+
+- **Subtransaction overflow.** A bucket retried row by row runs up to about 100 subtransactions
+  that write, inside one transaction. Postgres caches 64 subtransaction XIDs per backend
+  (`PGPROC_MAX_CACHED_SUBXIDS`). Past that, the transaction's subtransaction list overflows, and
+  until it commits, every other session's snapshot visibility checks have to consult
+  `pg_subtrans`. That lasts only for one retry transaction of about 20 ms, but a table that makes
+  every bucket fail causes it constantly.
+  - Mitigations: retry by bisection instead of one row at a time. Split a failing bucket in
+    half, recursively; one bad row in 100 then needs about 14 subtransactions instead of 100,
+    and the retry gets cheaper too. Or cap the subtransactions per transaction below 64 by
+    committing the retry in chunks.
+- **What happens to a row that fails on its own is a policy choice.** Here it is dropped with a
+  WARNING, and its request deleted. Alternatives: keep the request and retry later, which risks a
+  loop if the failure is permanent, or move it to a dead-letter table.
+- **Toolchain issue (unrelated to the design).** This machine's Xcode linker (ld-27037)
+  sometimes produced a release dylib that macOS refused to load ("mis-aligned LINKEDIT string
+  pool"). Which build was affected depended on the exact binary, not on the code. `main` was
+  measured with the repo's release profile (fat LTO) and `subxact-retire` with thin LTO, the
+  profiles that linked correctly for each. The normal-path numbers match `main`'s earlier fat-LTO
+  runs (section 5's baseline), so the LTO difference doesn't show up here.
+
 ## Takeaways
 
 **Pipelining beats batching even without pg_net's pause.** Section 2 removes pg_net's 1 s pause.
@@ -267,6 +359,11 @@ is the "1 s, 200 in flight" row in section 3. It matches pg_net with no slow req
 **Committing responses in buckets matters as much as pipelining.** With a bucket of 1, one
 transaction per response, pg_rest is 14× slower on fast bursts and uses 9× more CPU per request
 (section 5).
+
+**Store each bucket in a subtransaction.** It costs nothing on the normal path. Without it, one
+bad row (e.g. a raising trigger) puts the worker in a crash loop that never drains the queue and
+re-sends every request about once a second. With it, only the bad rows are lost, and a retried
+bucket costs about 20 ms (section 6).
 
 **A 50 ms pause does not reduce steady-rate CPU at 100 req/s.** The steady benchmark enqueues a
 batch every 100 ms. A 50 ms pause is shorter than that gap, so pg_rest still commits about twice

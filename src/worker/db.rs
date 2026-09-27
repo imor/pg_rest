@@ -5,9 +5,11 @@
 //! only assigns one when rows are actually modified, like pg_net.
 
 use std::ffi::CStr;
+use std::panic::AssertUnwindSafe;
 use std::ptr::NonNull;
 use std::time::Duration;
 
+use pgrx::pg_sys::panic::CaughtError;
 use pgrx::prelude::*;
 use pgrx::{FromDatum, IntoDatum, JsonB};
 use serde_json::Value;
@@ -35,6 +37,10 @@ const RETIRE_SQL: &CStr = c"
 /// exactly once (as an InitPlan) and the update is a primary key lookup, whatever the planner's
 /// row estimates. With a join, stale statistics (e.g. `reltuples = 0` after autovacuum ran on an
 /// empty queue) can produce a nested loop that re-runs the locking subquery for every queue row.
+/// Deletes requests whose response could not be stored (see `retire_bucket`).
+const DELETE_REQUESTS_SQL: &CStr = c"
+    delete from rest.http_request_queue where id = any($1)";
+
 const CLAIM_SQL: &CStr = c"
     update rest.http_request_queue
     set claimed_at = now()
@@ -165,6 +171,7 @@ impl Plan {
 pub struct Plans {
     reset_claims: Plan,
     retire: Plan,
+    delete_requests: Plan,
     claim: Plan,
     delete_expired: Plan,
 }
@@ -212,6 +219,7 @@ pub fn run_tick(plans: &mut Option<Plans>, work: TickWork) -> Vec<Claimed> {
                     pg_sys::TEXTARRAYOID,
                 ],
             ),
+            delete_requests: Plan::prepare(DELETE_REQUESTS_SQL, &[pg_sys::INT8ARRAYOID]),
             claim: Plan::prepare(CLAIM_SQL, &[pg_sys::INT4OID]),
             delete_expired: Plan::prepare(DELETE_EXPIRED_SQL, &[pg_sys::TEXTOID, pg_sys::INT4OID]),
         });
@@ -224,7 +232,7 @@ pub fn run_tick(plans: &mut Option<Plans>, work: TickWork) -> Vec<Claimed> {
         }
 
         if !work.retire.is_empty() {
-            retire(&plans.retire, work.retire);
+            retire_bucket(plans, work.retire);
         }
 
         let claimed = if work.claim > 0 {
@@ -243,6 +251,103 @@ pub fn run_tick(plans: &mut Option<Plans>, work: TickWork) -> Vec<Claimed> {
 
         claimed
     })
+}
+
+/// Runs `f` in a subtransaction. If it raises an error, the subtransaction is rolled back and the
+/// error is returned; the surrounding transaction carries on. Follows what PL/pgSQL does for a
+/// block with an `EXCEPTION` clause. Must be called while connected to SPI.
+fn in_subtransaction<R>(f: impl FnOnce() -> R) -> Result<R, Box<CaughtError>> {
+    unsafe {
+        let oldcontext = pg_sys::CurrentMemoryContext;
+        let oldowner = pg_sys::CurrentResourceOwner;
+        pg_sys::BeginInternalSubTransaction(std::ptr::null());
+        pg_sys::MemoryContextSwitchTo(oldcontext);
+
+        let result = PgTryBuilder::new(AssertUnwindSafe(|| Ok(f())))
+            .catch_others(|e| Err(Box::new(e)))
+            .catch_rust_panic(|e| Err(Box::new(e)))
+            .execute();
+
+        pg_sys::MemoryContextSwitchTo(oldcontext);
+        match result {
+            Ok(_) => pg_sys::ReleaseCurrentSubTransaction(),
+            Err(_) => {
+                // pgrx leaves a Postgres error on the error stack (so it could be rethrown);
+                // it is handled here, so clear it before rolling back.
+                pg_sys::FlushErrorState();
+                pg_sys::RollbackAndReleaseCurrentSubTransaction();
+            }
+        }
+        pg_sys::MemoryContextSwitchTo(oldcontext);
+        pg_sys::CurrentResourceOwner = oldowner;
+        result
+    }
+}
+
+/// A query cancel (`pg_cancel_backend`) is not a problem with the rows, so it isn't handled
+/// here: re-raise it, like PL/pgSQL's `WHEN OTHERS` does.
+fn rethrow_if_canceled(e: Box<CaughtError>) -> Box<CaughtError> {
+    if error_report(&e).sql_error_code() == PgSqlErrorCode::ERRCODE_QUERY_CANCELED {
+        e.rethrow()
+    }
+    e
+}
+
+fn error_report(e: &CaughtError) -> &pgrx::pg_sys::panic::ErrorReportWithLevel {
+    match e {
+        CaughtError::PostgresError(r) | CaughtError::ErrorReport(r) => r,
+        CaughtError::RustPanic { ereport, .. } => ereport,
+    }
+}
+
+/// Retires a bucket of responses.
+///
+/// Normally the whole bucket is stored with one statement, in a subtransaction. If that fails
+/// (e.g. a user trigger on `_http_response` raises), the subtransaction is rolled back and the
+/// responses are stored one at a time, each in its own subtransaction, so that one bad row
+/// doesn't lose the rest of the bucket. A response that still can't be stored is dropped with a
+/// warning, and its request is deleted so it isn't sent again forever.
+fn retire_bucket(plans: &Plans, responses: &[HttpResponse]) {
+    let Err(e) = in_subtransaction(|| retire(&plans.retire, responses)) else {
+        return;
+    };
+    let e = rethrow_if_canceled(e);
+    debug1!(
+        "pg_rest worker: storing a bucket of {} responses failed ({}), retrying them one at a time",
+        responses.len(),
+        error_report(&e).message()
+    );
+
+    let mut dropped = Vec::new();
+    for response in responses {
+        if let Err(e) = in_subtransaction(|| retire(&plans.retire, std::slice::from_ref(response)))
+        {
+            let e = rethrow_if_canceled(e);
+            warning!(
+                "pg_rest worker: could not store the response to request {}, dropping it: {}",
+                response.id,
+                error_report(&e).message()
+            );
+            dropped.push(response.id);
+        }
+    }
+
+    if !dropped.is_empty() {
+        let delete = in_subtransaction(|| {
+            plans
+                .delete_requests
+                .execute(&[dropped.clone().into_datum()], pg_sys::SPI_OK_DELETE)
+        });
+        if let Err(e) = delete {
+            let e = rethrow_if_canceled(e);
+            warning!(
+                "pg_rest worker: could not delete {} requests whose responses were dropped; \
+                 they stay claimed and are sent again after the worker restarts: {}",
+                dropped.len(),
+                error_report(&e).message()
+            );
+        }
+    }
 }
 
 fn retire(plan: &Plan, responses: &[HttpResponse]) {
